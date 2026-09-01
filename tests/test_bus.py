@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from agent_bus import Bus, BusError, project_id
 from agent_bus.cli import main as cli_main
+from agent_bus.core import SCHEMA, _canonical, _hash_body
 
 
 def _send_one(args: tuple[str, str, str]) -> int:
@@ -79,6 +80,139 @@ class BusTests(unittest.TestCase):
         self.assertEqual(self.bus.inbox("claude", "a"), ([], []))
         other, _ = self.bus.inbox("claude", "b")
         self.assertEqual(len(other), 1)
+
+    def test_exact_ack_leaves_messages_appended_after_peek_pending(self) -> None:
+        for ref in ("one", "two", "three"):
+            self.bus.send("codex", "claude", "fyi", ref)
+        peeked, issues = self.bus.inbox("claude", "adapter", peek=True)
+        self.assertFalse(issues)
+        self.assertEqual([message.sequence for message in peeked], [1, 2, 3])
+        self.bus.send("codex", "claude", "fyi", "after-peek")
+        ack = self.bus.ack("claude", "adapter", through_sequence=3)
+        self.assertEqual(ack["acked_sequence"], 3)
+        self.assertEqual(ack["pending_count"], 1)
+        pending, issues = self.bus.inbox("claude", "adapter", peek=True)
+        self.assertFalse(issues)
+        self.assertEqual([(message.sequence, message.ref) for message in pending],
+                         [(4, "after-peek")])
+        self.assertEqual(
+            self.bus.ack("claude", "adapter", through_sequence=3), ack)
+        with self.assertRaisesRegex(BusError, "behind cursor"):
+            self.bus.ack("claude", "adapter", through_sequence=2)
+        with self.assertRaisesRegex(BusError, "not present"):
+            self.bus.ack("claude", "adapter", through_sequence=5)
+
+    def test_consumer_status_reports_exact_lag_without_advancing(self) -> None:
+        self.bus.send("codex", "claude", "fyi", "one")
+        self.bus.send("codex", "claude", "fyi", "two")
+        before = self.bus.consumer_status("claude", "status-reader")
+        self.assertEqual(before["acked_sequence"], 0)
+        self.assertEqual(before["pending_count"], 2)
+        self.assertEqual(before["first_pending_sequence"], 1)
+        self.bus.ack("claude", "status-reader", through_sequence=1)
+        after = self.bus.consumer_status("claude", "status-reader")
+        self.assertEqual(after["acked_sequence"], 1)
+        self.assertEqual(after["last_sequence"], 2)
+        self.assertEqual(after["pending_count"], 1)
+        self.assertEqual(after["first_pending_sequence"], 2)
+
+    def test_v1_log_reopens_and_v2_links_are_hash_bound(self) -> None:
+        body = {
+            "schema": SCHEMA, "version": 1, "sequence": 1,
+            "ts": "2026-09-01T00:00:00.000000Z", "from": "codex",
+            "to": "claude", "kind": "ask-ready", "ref": "legacy",
+        }
+        body["message_sha256"] = _hash_body(body)
+        log = self.bus.state_dir / "inboxes" / "claude.jsonl"
+        log.write_bytes(_canonical(body) + b"\n")
+        log.chmod(0o600)
+        current = self.bus.send(
+            "claude", "claude-review", "verdict", "review/current",
+            reply_to="claude:1", supersedes="codex:9")
+        # The same recipient log may transition from legacy v1 to v2.
+        appended = self.bus.send(
+            "terra", "claude", "ruling", "current",
+            reply_to="claude:1", supersedes="claude:1")
+        messages, issues = self.bus.inbox("claude", "mixed-reader")
+        self.assertFalse(issues)
+        self.assertEqual([message.version for message in messages], [1, 2])
+        self.assertEqual(messages[1].reply_to, "claude:1")
+        self.assertEqual(messages[1].supersedes, "claude:1")
+        self.assertEqual(current.version, 2)
+        with self.assertRaisesRegex(BusError, "invalid message reply_to"):
+            self.bus.send("codex", "claude", "fyi", "bad",
+                          reply_to="not-a-link")
+
+    def test_send_once_suppresses_only_a_recent_semantic_duplicate(self) -> None:
+        first = self.bus.send(
+            "codex", "claude", "status", "run/one", once=True,
+            note="still-running")
+        duplicate = self.bus.send(
+            "codex", "claude", "status", "run/one", once=True,
+            note="still-running")
+        self.assertEqual(duplicate.sequence, first.sequence)
+        self.assertTrue(duplicate.duplicate_suppressed)
+        messages, issues = self.bus.inbox("claude", "dedupe", peek=True)
+        self.assertFalse(issues)
+        self.assertEqual(len(messages), 1)
+        intentional = self.bus.send(
+            "codex", "claude", "status", "run/one",
+            note="still-running")
+        self.assertEqual(intentional.sequence, 2)
+        self.assertFalse(intentional.duplicate_suppressed)
+        changed = self.bus.send(
+            "codex", "claude", "status", "run/one", once=True,
+            note="finished")
+        self.assertEqual(changed.sequence, 3)
+
+    def test_causal_metadata_surfaces_stale_premise_at_send_time(self) -> None:
+        self.bus.send("claude", "codex", "ruling", "new-ruling")
+        stale = self.bus.send(
+            "codex", "claude", "ask-withdrawn", "old-premise",
+            seen_peer_sequence=0)
+        self.assertEqual(stale.seen_peer_sequence, 0)
+        self.assertEqual(stale.peer_sequence_at_send, 1)
+        self.assertTrue(stale.stale_premise)
+        current = self.bus.send(
+            "codex", "claude", "ack", "new-ruling",
+            seen_peer_sequence=1, reply_to="claude:1")
+        self.assertFalse(current.stale_premise)
+        with self.assertRaisesRegex(BusError, "not present"):
+            self.bus.send(
+                "codex", "claude", "fyi", "future",
+                seen_peer_sequence=2)
+        reopened, issues = self.bus.inbox("claude", "causal", peek=True)
+        self.assertFalse(issues)
+        self.assertTrue(reopened[0].stale_premise)
+        self.assertFalse(reopened[1].stale_premise)
+
+    def test_merged_log_is_chronological_and_cursor_free(self) -> None:
+        self.bus.send("codex", "claude", "ask-ready", "first")
+        time.sleep(0.001)
+        self.bus.send("claude", "codex", "verdict", "second")
+        messages, issues = self.bus.log()
+        self.assertFalse(issues)
+        self.assertEqual([message.ref for message in messages],
+                         ["first", "second"])
+        self.assertFalse(any((self.bus.state_dir / "cursors").iterdir()))
+
+    def test_cli_log_follow_observes_append_without_cursor(self) -> None:
+        def append() -> None:
+            time.sleep(0.04)
+            self.bus.send("luna", "codex", "result-ready", "late-result")
+
+        thread = threading.Thread(target=append)
+        thread.start()
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            code = cli_main([
+                "log", "--project", str(self.project),
+                "--state-root", str(self.state), "--follow",
+                "--timeout", "0.12", "--poll-interval", "0.01"])
+        thread.join()
+        self.assertEqual((code, stderr.getvalue()), (0, ""))
+        self.assertIn("luna->codex result-ready late-result", stdout.getvalue())
+        self.assertFalse(any((self.bus.state_dir / "cursors").iterdir()))
 
     def test_malformed_trailing_line_reported_without_cursor_advance(self) -> None:
         self.bus.send("codex", "claude", "fyi", "good")
@@ -178,14 +312,17 @@ class BusTests(unittest.TestCase):
         thread = threading.Thread(target=append)
         thread.start()
         started = time.monotonic()
-        messages, issues = self.bus.watch("claude", "watcher", timeout=1)
+        messages, issues = self.bus.watch(
+            "claude", "watcher", timeout=1, poll_interval=0.02)
         elapsed = time.monotonic() - started
         thread.join()
         self.assertFalse(issues)
         self.assertEqual([m.ref for m in messages], ["watched"])
         self.assertLess(elapsed, 1)
         started = time.monotonic()
-        self.assertEqual(self.bus.watch("quiet-target", "quiet", timeout=0.12), ([], []))
+        self.assertEqual(self.bus.watch(
+            "quiet-target", "quiet", timeout=0.12,
+            poll_interval=0.02), ([], []))
         self.assertLess(time.monotonic() - started, 0.5)
         for timeout in (float("nan"), float("inf"), -1, True):
             with self.assertRaisesRegex(BusError, "finite and non-negative"):
@@ -221,6 +358,34 @@ class BusTests(unittest.TestCase):
         rendered = json.loads(output)
         self.assertEqual(rendered["status"], "NON_AUTHORITATIVE")
         self.assertEqual(rendered["message"]["ref"], "artifact://plan")
+        code, output, error = invoke([
+            "status", *common, "--to", "muse", "--consumer", "harness",
+            "--json"])
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(json.loads(output)["consumer"]["pending_count"], 0)
+        code, output, error = invoke([
+            "send", *common, "--from", "codex", "--to", "muse",
+            "--kind", "fyi", "--ref", "artifact://followup",
+            "--reply-to", "muse:1", "--supersedes", "muse:1", "--json"])
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(json.loads(output)["message"]["reply_to"], "muse:1")
+        code, output, error = invoke([
+            "send", *common, "--from", "codex", "--to", "muse",
+            "--kind", "fyi", "--ref", "artifact://followup",
+            "--reply-to", "muse:1", "--supersedes", "muse:1",
+            "--once", "--json"])
+        self.assertEqual((code, error), (0, ""))
+        self.assertTrue(json.loads(output)["annotations"][
+            "duplicate_suppressed"])
+        code, output, error = invoke([
+            "log", *common, "--json"])
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(len(output.splitlines()), 2)
+        code, output, error = invoke([
+            "ack", *common, "--to", "muse", "--consumer", "harness",
+            "--through", "2", "--json"])
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(json.loads(output)["ack"]["acked_sequence"], 2)
         self.assertEqual(invoke(["doctor", *common])[1].strip(), "ok")
 
 

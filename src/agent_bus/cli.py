@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
+import time
 from typing import Any
 
-from .core import Bus, BusError
+from .core import Bus, BusError, Message
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -27,8 +29,13 @@ def _parser() -> argparse.ArgumentParser:
     send.add_argument("--to", dest="to_peer", required=True, help="recipient agent ID")
     send.add_argument("--kind", required=True)
     send.add_argument("--ref", required=True)
-    for name in ("head", "verdict", "ledger", "note"):
+    for name in ("head", "verdict", "ledger", "note", "reply-to",
+                 "supersedes"):
         send.add_argument(f"--{name}")
+    send.add_argument("--seen-peer-sequence", type=int)
+    send.add_argument("--once", action="store_true",
+                      help="suppress a semantic duplicate in the recent window")
+    send.add_argument("--dedupe-window", type=int, default=20)
     send.add_argument("--json", action="store_true")
 
     for name in ("inbox", "watch"):
@@ -44,19 +51,72 @@ def _parser() -> argparse.ArgumentParser:
 
     status = sub.add_parser("status", help="show state size and project ID")
     project_args(status)
+    status.add_argument("--to", dest="to_peer",
+                        help="recipient for consumer-lag detail")
+    status.add_argument("--consumer",
+                        help="consumer for consumer-lag detail")
     status.add_argument("--json", action="store_true")
+    ack = sub.add_parser(
+        "ack", help="advance one consumer through an exact processed sequence")
+    project_args(ack)
+    ack.add_argument("--to", dest="to_peer", required=True,
+                     help="recipient agent ID")
+    ack.add_argument("--consumer", required=True)
+    ack.add_argument("--through", type=int, required=True,
+                     help="last sequence successfully processed")
+    ack.add_argument("--json", action="store_true")
+    log = sub.add_parser(
+        "log", help="merge all directions without advancing cursors")
+    project_args(log)
+    log.add_argument("--follow", action="store_true")
+    log.add_argument("--timeout", type=float,
+                     help="bounded follow duration in seconds")
+    log.add_argument("--poll-interval", type=float, default=1.0)
+    log.add_argument("--json", action="store_true")
     doctor = sub.add_parser("doctor", help="check private state and logs")
     project_args(doctor)
     doctor.add_argument("--json", action="store_true")
     return parser
 
 
-def _render_message(data: dict[str, Any], as_json: bool) -> None:
+def _render_message(message: Message, as_json: bool, *, compact: bool = False,
+                    flush: bool = False) -> None:
     # Bus text is always a pointer and explicitly non-authoritative.
+    annotations: dict[str, Any] = {}
+    if message.stale_premise:
+        annotations["stale_premise"] = {
+            "seen_peer_sequence": message.seen_peer_sequence,
+            "peer_sequence_at_send": message.peer_sequence_at_send,
+        }
+    if message.duplicate_suppressed:
+        annotations["duplicate_suppressed"] = True
     if as_json:
-        print(json.dumps({"status": "NON_AUTHORITATIVE", "message": data}, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
+        payload: dict[str, Any] = {
+            "status": "NON_AUTHORITATIVE", "message": message.as_dict()}
+        if annotations:
+            payload["annotations"] = annotations
+        print(json.dumps(payload, ensure_ascii=True, sort_keys=True,
+                         separators=(",", ":")), flush=flush)
+    elif compact:
+        timestamp = message.ts[11:19]
+        fields = [
+            f"{timestamp} {message.from_peer}->{message.to_peer}",
+            message.kind, message.ref]
+        for key in ("verdict", "ledger", "head", "reply_to", "supersedes"):
+            value = getattr(message, key)
+            if value is not None:
+                fields.append(f"{key}={value}")
+        if message.stale_premise:
+            fields.append(
+                f"STALE(seen={message.seen_peer_sequence},available={message.peer_sequence_at_send})")
+        print("NON_AUTHORITATIVE " + " ".join(fields), flush=flush)
     else:
-        print("NON_AUTHORITATIVE " + json.dumps(data, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
+        payload = {"message": message.as_dict()}
+        if annotations:
+            payload["annotations"] = annotations
+        print("NON_AUTHORITATIVE " + json.dumps(
+            payload, ensure_ascii=True, sort_keys=True,
+            separators=(",", ":")), flush=flush)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -68,9 +128,15 @@ def main(argv: list[str] | None = None) -> int:
             print(f"initialized {bus.project_id} at {bus.state_dir}")
             return 0
         if args.command == "send":
-            optional = {key: getattr(args, key) for key in ("head", "verdict", "ledger", "note") if getattr(args, key) is not None}
-            message = bus.send(args.from_peer, args.to_peer, args.kind, args.ref, **optional)
-            _render_message(message.as_dict(), args.json)
+            optional = {
+                key: getattr(args, key)
+                for key in ("head", "verdict", "ledger", "note",
+                            "reply_to", "supersedes", "seen_peer_sequence")
+                if getattr(args, key) is not None}
+            message = bus.send(
+                args.from_peer, args.to_peer, args.kind, args.ref,
+                once=args.once, dedupe_window=args.dedupe_window, **optional)
+            _render_message(message, args.json)
             return 0
         if args.command in ("inbox", "watch"):
             if args.command == "inbox":
@@ -78,7 +144,7 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 messages, issues = bus.watch(args.to_peer, args.consumer, timeout=args.timeout)
             for message in messages:
-                _render_message(message.as_dict(), args.json)
+                _render_message(message, args.json)
             for issue in issues:
                 if args.json:
                     print(json.dumps({"status": "NON_AUTHORITATIVE", "issue": issue}, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
@@ -87,13 +153,72 @@ def main(argv: list[str] | None = None) -> int:
             return 2 if issues else 0
         if args.command == "status":
             result = bus.status()
+            if (args.to_peer is None) != (args.consumer is None):
+                raise BusError("status requires --to and --consumer together")
+            if args.to_peer is not None:
+                result["consumer"] = bus.consumer_status(
+                    args.to_peer, args.consumer)
             if args.json:
                 print(json.dumps(result, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
             else:
                 print(f"project_id={result['project_id']} state_dir={result['state_dir']} total_bytes={result['total_bytes']}")
                 if result["warning"]:
                     print(f"warning: {result['warning']}", file=sys.stderr)
+                if "consumer" in result:
+                    consumer = result["consumer"]
+                    print(
+                        f"consumer={consumer['consumer']} recipient={consumer['recipient']} "
+                        f"acked={consumer['acked_sequence']} last={consumer['last_sequence']} "
+                        f"pending={consumer['pending_count']}")
             return 0
+        if args.command == "ack":
+            result = bus.ack(
+                args.to_peer, args.consumer,
+                through_sequence=args.through)
+            if args.json:
+                print(json.dumps(
+                    {"status": "NON_AUTHORITATIVE", "ack": result},
+                    ensure_ascii=True, sort_keys=True, separators=(",", ":")))
+            else:
+                print("NON_AUTHORITATIVE " + json.dumps(
+                    result, ensure_ascii=True, sort_keys=True,
+                    separators=(",", ":")))
+            return 0
+        if args.command == "log":
+            if (args.timeout is not None
+                    and (isinstance(args.timeout, bool)
+                         or not math.isfinite(args.timeout)
+                         or args.timeout < 0)):
+                raise BusError("timeout must be finite and non-negative")
+            if (isinstance(args.poll_interval, bool)
+                    or not math.isfinite(args.poll_interval)
+                    or args.poll_interval <= 0):
+                raise BusError("poll interval must be finite and positive")
+            started = time.monotonic()
+            messages, issues = bus.log()
+            seen = {message.message_sha256 for message in messages}
+            for message in messages:
+                _render_message(
+                    message, args.json, compact=not args.json,
+                    flush=args.follow)
+            while args.follow and not issues:
+                elapsed = time.monotonic() - started
+                if args.timeout is not None and elapsed >= args.timeout:
+                    break
+                remaining = (None if args.timeout is None else
+                             max(0.0, args.timeout - elapsed))
+                time.sleep(args.poll_interval if remaining is None else
+                           min(args.poll_interval, remaining))
+                current, issues = bus.log()
+                for message in current:
+                    if message.message_sha256 not in seen:
+                        seen.add(message.message_sha256)
+                        _render_message(
+                            message, args.json, compact=not args.json,
+                            flush=True)
+            for issue in issues:
+                print(f"NON_AUTHORITATIVE issue: {issue}", file=sys.stderr)
+            return 2 if issues else 0
         if args.command == "doctor":
             findings = bus.doctor()
             if args.json:
