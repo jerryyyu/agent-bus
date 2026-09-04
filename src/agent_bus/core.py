@@ -454,28 +454,20 @@ def _actionable_items(messages: list[Message]) -> list[ActionableItem]:
         return []
     nodes = {f"{message.to_peer}:{message.sequence}": message
              for message in messages}
-    parent = {anchor: anchor for anchor in nodes}
+    superseded: set[str] = set()
+    closed: set[str] = set()
+    local_closers: set[str] = set()
 
-    def find(anchor: str) -> str:
-        while parent[anchor] != anchor:
-            parent[anchor] = parent[parent[anchor]]
-            anchor = parent[anchor]
-        return anchor
-
-    def union(left: str, right: str) -> None:
-        left_root, right_root = find(left), find(right)
-        if left_root != right_root:
-            parent[right_root] = left_root
-
-    # Explicit replacements form a chain. Chatter is deliberately incapable
-    # of replacing an ask, even if a sender mistakenly attaches supersedes.
+    # Explicit replacements hide only the exact message they replace. A reply
+    # to an older chain member must not close a newer successor. Chatter is
+    # deliberately incapable of replacing or closing an ask.
     for anchor, message in nodes.items():
         if (message.supersedes in nodes
                 and message.kind not in CHATTER_KINDS):
-            union(anchor, message.supersedes)
+            superseded.add(message.supersedes)
 
-    # Link only the named close transitions. A generic reply and an ack are
-    # delivery context, not proof that the underlying work is resolved.
+    # Link only the named exact close transitions. A generic reply and an ack
+    # are delivery context, not proof that the underlying work is resolved.
     for anchor, message in nodes.items():
         if (message.kind == "ask-withdrawn"
                 and (message.reply_to in nodes
@@ -483,9 +475,11 @@ def _actionable_items(messages: list[Message]) -> list[ActionableItem]:
             target = (message.reply_to if message.reply_to in nodes
                       else message.supersedes)
             assert target is not None
-            union(anchor, target)
+            closed.add(target)
+            local_closers.add(anchor)
         elif message.kind == "verdict" and message.reply_to in nodes:
-            union(anchor, message.reply_to)
+            closed.add(message.reply_to)
+            local_closers.add(anchor)
     run_starts: dict[str, list[str]] = {}
     for anchor, message in nodes.items():
         if message.kind == "run-started":
@@ -494,44 +488,27 @@ def _actionable_items(messages: list[Message]) -> list[ActionableItem]:
             eligible = [candidate for candidate in run_starts.get(
                 message.ref, []) if nodes[candidate].sequence < message.sequence]
             if eligible:
-                union(anchor, eligible[-1])
-
-    components: dict[str, list[tuple[str, Message]]] = {}
-    for anchor, message in nodes.items():
-        components.setdefault(find(anchor), []).append((anchor, message))
+                closed.add(eligible[-1])
+                local_closers.add(anchor)
 
     result: list[ActionableItem] = []
-    for members in components.values():
-        members.sort(key=lambda row: row[1].sequence)
-        local_anchors = {anchor for anchor, _message in members}
-        closed = any(
-            (message.kind == "ask-withdrawn"
-             and (message.reply_to in local_anchors
-                  or message.supersedes in local_anchors))
-            or (message.kind == "verdict"
-                and message.reply_to in local_anchors)
-            or (message.kind == "run-ended"
-                and any(other.kind == "run-started"
-                        and other.ref == message.ref
-                        and other.sequence < message.sequence
-                        for _other_anchor, other in members))
-            for _anchor, message in members)
-        if closed:
+    for anchor, message in nodes.items():
+        if (anchor in superseded or anchor in closed or anchor in local_closers
+                or message.kind not in ACTIONABLE_KINDS):
             continue
-        candidates = [
-            (anchor, message) for anchor, message in members
-            if message.kind in ACTIONABLE_KINDS
-            and not (message.kind == "verdict" and message.reply_to in nodes)
-        ]
-        if not candidates:
-            continue
-        _anchor, newest = candidates[-1]
-        anchors = tuple(anchor for anchor, _message in members)
+        ancestry = [anchor]
+        prior = message.supersedes
+        seen = {anchor}
+        while prior in nodes and prior not in seen:
+            ancestry.append(prior)
+            seen.add(prior)
+            prior = nodes[prior].supersedes
+        ancestry.sort(key=lambda item: nodes[item].sequence)
         result.append(ActionableItem(
-            kind=newest.kind, ref=newest.ref, head=newest.head,
-            sender=newest.from_peer, newest_sequence=newest.sequence,
-            collapsed_transition_count=len(members) - 1,
-            sequence_anchors=anchors))
+            kind=message.kind, ref=message.ref, head=message.head,
+            sender=message.from_peer, newest_sequence=message.sequence,
+            collapsed_transition_count=len(ancestry) - 1,
+            sequence_anchors=tuple(ancestry)))
     result.sort(key=lambda item: item.newest_sequence)
     return result
 

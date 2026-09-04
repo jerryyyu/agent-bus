@@ -214,6 +214,22 @@ class BusTests(unittest.TestCase):
             [(item.kind, item.ref, item.sequence_anchors) for item in items],
             [("run-ended", "run/earlier", ("claude:2",))])
 
+    def test_stale_reply_to_superseded_ask_does_not_close_successor(self) -> None:
+        self.bus.send("codex", "claude", "ask-ready", "old")
+        self.bus.send(
+            "codex", "claude", "ask-ready", "current",
+            supersedes="claude:1")
+        self.bus.send(
+            "terra", "claude", "verdict", "old-answer",
+            reply_to="claude:1")
+        items, issues, _batch = self.bus.actionable_inbox(
+            "claude", "stale-reply")
+        self.assertFalse(issues)
+        self.assertEqual(
+            [(item.ref, item.newest_sequence, item.sequence_anchors)
+             for item in items],
+            [("current", 2, ("claude:1", "claude:2"))])
+
     def test_consumer_status_reports_exact_lag_without_advancing(self) -> None:
         self.bus.send("codex", "claude", "fyi", "one")
         self.bus.send("codex", "claude", "fyi", "two")
