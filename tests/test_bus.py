@@ -102,6 +102,118 @@ class BusTests(unittest.TestCase):
         with self.assertRaisesRegex(BusError, "not present"):
             self.bus.ack("claude", "adapter", through_sequence=5)
 
+    def test_batch_ack_is_bound_to_peek_and_leaves_later_messages_pending(self) -> None:
+        for ref in ("one", "two", "three"):
+            self.bus.send("codex", "claude", "fyi", ref)
+        messages, issues, batch = self.bus.peek_batch("claude", "batch-reader")
+        self.assertFalse(issues)
+        self.assertIsNotNone(batch)
+        assert batch is not None
+        self.assertEqual([message.sequence for message in messages], [1, 2, 3])
+        self.assertEqual((batch.start_sequence, batch.end_sequence,
+                          batch.message_count), (0, 3, 3))
+        # A later append is not part of the token and must remain pending.
+        self.bus.send("codex", "claude", "fyi", "after-peek")
+        result = self.bus.ack_batch(
+            "claude", "batch-reader", token=batch.token)
+        self.assertEqual(result["acked_sequence"], 3)
+        self.assertEqual(result["pending_count"], 1)
+        pending, issues = self.bus.inbox(
+            "claude", "batch-reader", peek=True)
+        self.assertFalse(issues)
+        self.assertEqual([(message.sequence, message.ref)
+                          for message in pending], [(4, "after-peek")])
+        with self.assertRaisesRegex(BusError, "cursor changed"):
+            self.bus.ack_batch("claude", "batch-reader", token=batch.token)
+        with self.assertRaisesRegex(BusError, "recipient or consumer mismatch"):
+            self.bus.ack_batch("claude", "other-reader", token=batch.token)
+
+    def test_batch_ack_refuses_token_tamper_and_log_rotation(self) -> None:
+        self.bus.send("codex", "claude", "ask-ready", "review")
+        _messages, _issues, batch = self.bus.peek_batch("claude", "rotated")
+        assert batch is not None
+        changed = batch.token[:-1] + ("A" if batch.token[-1] != "A" else "B")
+        with self.assertRaisesRegex(BusError, "batch token"):
+            self.bus.ack_batch("claude", "rotated", token=changed)
+
+        log = self.bus.state_dir / "inboxes" / "claude.jsonl"
+        replacement = log.with_suffix(".replacement")
+        replacement.write_bytes(log.read_bytes())
+        replacement.chmod(0o600)
+        os.replace(replacement, log)
+        with self.assertRaisesRegex(BusError, "rotated"):
+            self.bus.ack_batch("claude", "rotated", token=batch.token)
+
+    def test_actionable_view_is_conservative_compact_and_cursor_neutral(self) -> None:
+        self.bus.send("codex", "claude", "ask-ready", "ack-must-not-close")
+        self.bus.send(
+            "terra", "claude", "ack", "ack-must-not-close",
+            reply_to="claude:1")
+        self.bus.send("codex", "claude", "ask-ready", "old-request")
+        self.bus.send(
+            "codex", "claude", "ask-ready", "new-request",
+            head="abc123", supersedes="claude:3")
+        self.bus.send("codex", "claude", "ask-ready", "withdraw-me")
+        self.bus.send(
+            "codex", "claude", "ask-withdrawn", "withdraw-me",
+            reply_to="claude:5")
+        self.bus.send("codex", "claude", "ask-ready", "answer-me")
+        self.bus.send(
+            "terra", "claude", "verdict", "answer-me",
+            verdict="PASS", reply_to="claude:7")
+        self.bus.send("codex", "claude", "run-started", "run/one")
+        self.bus.send("codex", "claude", "run-ended", "run/one")
+        self.bus.send("codex", "claude", "status", "routine")
+        self.bus.send("luna", "claude", "task-ready", "still-open")
+
+        first, issues, batch = self.bus.actionable_inbox(
+            "claude", "action-reader")
+        second, second_issues, second_batch = self.bus.actionable_inbox(
+            "claude", "action-reader")
+        self.assertEqual((first, issues, batch),
+                         (second, second_issues, second_batch))
+        self.assertFalse(issues)
+        self.assertIsNotNone(batch)
+        self.assertFalse(
+            self.bus._cursor_path("claude", "action-reader").exists())
+        self.assertEqual(
+            [(item.kind, item.ref, item.head, item.newest_sequence,
+              item.collapsed_transition_count, item.sequence_anchors)
+             for item in first],
+            [
+                ("ask-ready", "ack-must-not-close", None, 1, 0,
+                 ("claude:1",)),
+                ("ask-ready", "new-request", "abc123", 4, 1,
+                 ("claude:3", "claude:4")),
+                ("task-ready", "still-open", None, 12, 0,
+                 ("claude:12",)),
+            ])
+
+    def test_actionable_reports_malformed_input_without_batch_or_cursor(self) -> None:
+        self.bus.send("codex", "claude", "ask-ready", "good")
+        log = self.bus.state_dir / "inboxes" / "claude.jsonl"
+        with log.open("ab") as stream:
+            stream.write(b'{"sequence":999')
+        items, issues, batch = self.bus.actionable_inbox(
+            "claude", "malformed-action")
+        self.assertEqual([item.ref for item in items], ["good"])
+        self.assertTrue(issues)
+        self.assertIsNone(batch)
+        self.assertFalse(
+            self.bus._cursor_path("claude", "malformed-action").exists())
+
+    def test_actionable_retains_unmatched_incoming_terminal_signal(self) -> None:
+        self.bus.send("codex", "claude", "run-started", "run/earlier")
+        self.bus.ack("claude", "terminal-reader", through_sequence=1)
+        self.bus.send("codex", "claude", "run-ended", "run/earlier")
+        items, issues, batch = self.bus.actionable_inbox(
+            "claude", "terminal-reader")
+        self.assertFalse(issues)
+        self.assertIsNotNone(batch)
+        self.assertEqual(
+            [(item.kind, item.ref, item.sequence_anchors) for item in items],
+            [("run-ended", "run/earlier", ("claude:2",))])
+
     def test_consumer_status_reports_exact_lag_without_advancing(self) -> None:
         self.bus.send("codex", "claude", "fyi", "one")
         self.bus.send("codex", "claude", "fyi", "two")
@@ -333,6 +445,40 @@ class BusTests(unittest.TestCase):
                     "quiet-target", "quiet", timeout=0,
                     poll_interval=interval)
 
+    def test_actionable_watch_ignores_chatter_and_is_cursor_neutral(self) -> None:
+        def append() -> None:
+            time.sleep(0.04)
+            self.bus.send("codex", "claude", "status", "routine")
+            time.sleep(0.04)
+            self.bus.send("codex", "claude", "ask-ready", "needs-review")
+
+        thread = threading.Thread(target=append)
+        thread.start()
+        items, issues, batch, changed = self.bus.watch_actionable(
+            "claude", "action-watch", timeout=1, poll_interval=0.01)
+        thread.join()
+        self.assertTrue(changed)
+        self.assertFalse(issues)
+        self.assertEqual([item.ref for item in items], ["needs-review"])
+        self.assertIsNotNone(batch)
+        self.assertFalse(
+            self.bus._cursor_path("claude", "action-watch").exists())
+
+        # A new watcher baselines the existing ask. More chatter does not
+        # produce a change or wake event.
+        def chatter() -> None:
+            time.sleep(0.03)
+            self.bus.send(
+                "terra", "claude", "ack", "needs-review",
+                reply_to="claude:2")
+
+        thread = threading.Thread(target=chatter)
+        thread.start()
+        items, issues, batch, changed = self.bus.watch_actionable(
+            "claude", "action-watch", timeout=0.12, poll_interval=0.01)
+        thread.join()
+        self.assertEqual((items, issues, batch, changed), ([], [], None, False))
+
     def test_cli_round_trip_is_generic_and_explicitly_nonauthoritative(self) -> None:
         state = self.state.parent / "cli-state"
 
@@ -387,6 +533,46 @@ class BusTests(unittest.TestCase):
         self.assertEqual((code, error), (0, ""))
         self.assertEqual(json.loads(output)["ack"]["acked_sequence"], 2)
         self.assertEqual(invoke(["doctor", *common])[1].strip(), "ok")
+
+    def test_cli_batch_and_actionable_round_trip(self) -> None:
+        state = self.state.parent / "cli-batch-state"
+
+        def invoke(args: list[str]) -> tuple[int, str, str]:
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                code = cli_main(args)
+            return code, stdout.getvalue(), stderr.getvalue()
+
+        common = ["--project", str(self.project), "--state-root", str(state)]
+        self.assertEqual(invoke(["init", *common])[0], 0)
+        self.assertEqual(invoke([
+            "send", *common, "--from", "codex", "--to", "claude",
+            "--kind", "ask-ready", "--ref", "review/one"])[0], 0)
+        code, output, error = invoke([
+            "inbox", *common, "--to", "claude", "--consumer", "model",
+            "--actionable", "--json"])
+        self.assertEqual((code, error), (0, ""))
+        actionable = json.loads(output)
+        self.assertEqual(actionable["status"], "NON_AUTHORITATIVE")
+        self.assertEqual(actionable["actionable"][0]["ref"], "review/one")
+        token = actionable["batch"]["token"]
+        code, output, error = invoke([
+            "ack", *common, "--to", "claude", "--consumer", "model",
+            "--batch", token, "--json"])
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(json.loads(output)["ack"]["acked_sequence"], 1)
+
+        self.assertEqual(invoke([
+            "send", *common, "--from", "codex", "--to", "claude",
+            "--kind", "fyi", "--ref", "raw/two"])[0], 0)
+        code, output, error = invoke([
+            "inbox", *common, "--to", "claude", "--consumer", "model",
+            "--peek", "--batch", "--json"])
+        self.assertEqual((code, error), (0, ""))
+        envelope = json.loads(output)
+        self.assertEqual(envelope["messages"][0]["ref"], "raw/two")
+        self.assertEqual(envelope["batch"]["start_sequence"], 1)
+        self.assertEqual(envelope["batch"]["end_sequence"], 2)
 
 
 if __name__ == "__main__":
