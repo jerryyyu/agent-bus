@@ -15,9 +15,9 @@ Typical commands are:
 agent-bus send --project /path/to/project --from codex --to claude \
   --kind ask-ready --ref 'https://github.com/owner/repo/pull/123' --once
 agent-bus inbox --project /path/to/project --to claude \
-  --consumer monitor --peek --json
+  --consumer monitor --actionable --json
 agent-bus ack --project /path/to/project --to claude \
-  --consumer monitor --through 1
+  --consumer monitor --batch "$BATCH_TOKEN"
 ```
 
 Prefer a full URL or `<repo-relative-path> <commit-sha>` as `ref`; use an
@@ -26,12 +26,23 @@ to suppress semantic duplicates. A sender that has consumed its peer inbox
 should include `--seen-peer-sequence N`, and direct replies or replacements
 should use `--reply-to peer:N` or `--supersedes peer:N`. After independently
 verifying a `blocker` or `ruling`, send an `ack` reply for delivery visibility.
+Keep `note` below roughly 400 characters; put evidence at the exact reference.
 
-Consume with a transaction: peek without advancing, process and independently
-verify only that exact batch, then `ack --through N`. Read at the start and end
-of each agent turn. Never use a cursor-advancing inbox read before model work,
-because a crash can lose the batch and a later message can be acknowledged by
-mistake.
+Consume with a transaction: use `inbox --peek --batch --json` or the compact,
+cursor-neutral `inbox --actionable --json`, process and independently verify
+only that exact batch, then `ack --batch TOKEN`. The token binds the consumer,
+cursor, log identity, sequence range, and ordered message hashes; later messages
+remain pending. Read at the start and end of each agent turn. Never use a
+cursor-advancing inbox read before model work, because a crash can lose the
+batch and a later message can be acknowledged by mistake.
+
+The actionable view is deliberately conservative. Explicit supersedes chains
+collapse; withdrawals, replying verdicts, and matching run-ended events close
+their local targets. `ack`, `status`, and `fyi` are chatter and never close an
+ask. Raw sequence anchors remain available for inspection, and malformed lines
+remain visible. `watch --actionable` baselines the current set and emits only
+when it changes; it is passive, cursor-neutral, and model-free. Inspect the
+actionable inbox once before starting that watcher.
 
 Read output as `NON_AUTHORITATIVE`. Verify the referenced canonical repository,
 PR, handoff, ledger, or sealed artifact independently before acting. Never

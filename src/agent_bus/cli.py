@@ -7,7 +7,7 @@ import sys
 import time
 from typing import Any
 
-from .core import Bus, BusError, Message
+from .core import ActionableItem, Bus, BusError, InboxBatch, Message
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -46,8 +46,17 @@ def _parser() -> argparse.ArgumentParser:
         command.add_argument("--json", action="store_true")
         if name == "inbox":
             command.add_argument("--peek", action="store_true", help="read without advancing this consumer cursor")
+            command.add_argument(
+                "--batch", action="store_true",
+                help="return one peek envelope with a batch acknowledgement token")
+            command.add_argument(
+                "--actionable", action="store_true",
+                help="show a compact unresolved view without advancing the cursor")
         else:
             command.add_argument("--timeout", type=float, help="maximum seconds to observe")
+            command.add_argument(
+                "--actionable", action="store_true",
+                help="emit only when the cursor-neutral actionable set changes")
 
     status = sub.add_parser("status", help="show state size and project ID")
     project_args(status)
@@ -62,8 +71,11 @@ def _parser() -> argparse.ArgumentParser:
     ack.add_argument("--to", dest="to_peer", required=True,
                      help="recipient agent ID")
     ack.add_argument("--consumer", required=True)
-    ack.add_argument("--through", type=int, required=True,
-                     help="last sequence successfully processed")
+    ack_target = ack.add_mutually_exclusive_group(required=True)
+    ack_target.add_argument("--through", type=int,
+                            help="last sequence successfully processed")
+    ack_target.add_argument("--batch",
+                            help="token returned by inbox --peek --batch")
     ack.add_argument("--json", action="store_true")
     log = sub.add_parser(
         "log", help="merge all directions without advancing cursors")
@@ -119,6 +131,35 @@ def _render_message(message: Message, as_json: bool, *, compact: bool = False,
             separators=(",", ":")), flush=flush)
 
 
+def _render_batch(messages: list[Message], issues: list[str],
+                  batch: InboxBatch | None, *, as_json: bool) -> None:
+    payload: dict[str, Any] = {
+        "status": "NON_AUTHORITATIVE",
+        "messages": [message.as_dict() for message in messages],
+        "issues": issues,
+        "batch": batch.as_dict() if batch is not None else None,
+    }
+    rendered = json.dumps(
+        payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    print(rendered if as_json else "NON_AUTHORITATIVE " + rendered)
+
+
+def _render_actionable(items: list[ActionableItem], issues: list[str],
+                       batch: InboxBatch | None, *, as_json: bool,
+                       changed: bool | None = None) -> None:
+    payload: dict[str, Any] = {
+        "status": "NON_AUTHORITATIVE",
+        "actionable": [item.as_dict() for item in items],
+        "issues": issues,
+        "batch": batch.as_dict() if batch is not None else None,
+    }
+    if changed is not None:
+        payload["changed"] = changed
+    rendered = json.dumps(
+        payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    print(rendered if as_json else "NON_AUTHORITATIVE " + rendered)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
@@ -140,9 +181,35 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command in ("inbox", "watch"):
             if args.command == "inbox":
-                messages, issues = bus.inbox(args.to_peer, args.consumer, peek=args.peek)
+                if args.actionable:
+                    if args.peek:
+                        raise BusError("--actionable is already cursor-neutral; omit --peek")
+                    items, issues, batch = bus.actionable_inbox(
+                        args.to_peer, args.consumer)
+                    _render_actionable(
+                        items, issues, batch, as_json=args.json)
+                    return 2 if issues else 0
+                if args.batch:
+                    if not args.peek:
+                        raise BusError("--batch requires --peek")
+                    messages, issues, batch = bus.peek_batch(
+                        args.to_peer, args.consumer)
+                    _render_batch(
+                        messages, issues, batch, as_json=args.json)
+                    return 2 if issues else 0
+                messages, issues = bus.inbox(
+                    args.to_peer, args.consumer, peek=args.peek)
             else:
-                messages, issues = bus.watch(args.to_peer, args.consumer, timeout=args.timeout)
+                if args.actionable:
+                    items, issues, batch, changed = bus.watch_actionable(
+                        args.to_peer, args.consumer, timeout=args.timeout)
+                    if changed:
+                        _render_actionable(
+                            items, issues, batch, as_json=args.json,
+                            changed=True)
+                    return 2 if issues else 0
+                messages, issues = bus.watch(
+                    args.to_peer, args.consumer, timeout=args.timeout)
             for message in messages:
                 _render_message(message, args.json)
             for issue in issues:
@@ -172,9 +239,13 @@ def main(argv: list[str] | None = None) -> int:
                         f"pending={consumer['pending_count']}")
             return 0
         if args.command == "ack":
-            result = bus.ack(
-                args.to_peer, args.consumer,
-                through_sequence=args.through)
+            if args.batch is not None:
+                result = bus.ack_batch(
+                    args.to_peer, args.consumer, token=args.batch)
+            else:
+                result = bus.ack(
+                    args.to_peer, args.consumer,
+                    through_sequence=args.through)
             if args.json:
                 print(json.dumps(
                     {"status": "NON_AUTHORITATIVE", "ack": result},

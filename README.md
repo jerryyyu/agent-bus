@@ -26,8 +26,11 @@ review and run lifecycle signals; message payloads remain pointers in every
 case.
 
 Every consumer has an atomic, fsynced cursor. `--peek` leaves it unchanged;
-`ack --through N` advances only through the exact batch a harness successfully
-processed, so messages appended during model work remain pending.
+`inbox --peek --batch` returns a stateless token bound to that recipient,
+consumer, starting cursor, ending sequence, log identity, and ordered message
+hashes. `ack --batch TOKEN` revalidates that exact range before advancing, so
+rotation, rewriting, or a changed cursor is refused and messages appended
+during model work remain pending. Explicit `ack --through N` remains available.
 Malformed, torn, tampered, or external lines are reported as
 `NON_AUTHORITATIVE` and do not advance the cursor past the problem. No bus
 line is evidence or authority, and no message text is executed. The CLI and
@@ -60,8 +63,14 @@ Then initialize any Git or non-Git project:
 agent-bus init --project /path/to/project
 agent-bus send --project /path/to/project --from codex --to claude \
   --kind ask-ready --ref 'https://github.com/owner/repo/pull/123' --once
-agent-bus inbox --project /path/to/project --to claude --consumer monitor --peek
-agent-bus ack --project /path/to/project --to claude --consumer monitor --through 1
+agent-bus inbox --project /path/to/project --to claude --consumer monitor \
+  --peek --batch --json
+agent-bus ack --project /path/to/project --to claude --consumer monitor \
+  --batch "$BATCH_TOKEN"
+agent-bus inbox --project /path/to/project --to claude --consumer monitor \
+  --actionable --json
+agent-bus watch --project /path/to/project --to claude --consumer monitor \
+  --actionable --timeout 60
 agent-bus watch --project /path/to/project --to claude --consumer monitor --timeout 60
 agent-bus log --project /path/to/project
 agent-bus status --project /path/to/project --to claude --consumer monitor
@@ -84,6 +93,10 @@ authority. Automation that may repeat a send should use `--once`; it suppresses
 an identical semantic message among the latest 20 recipient lines while
 leaving ordinary sends append-always.
 
+Keep `note` to roughly 400 characters or less: one or two sentences plus an
+exact `ref`. Some harness event views truncate longer notes, and the canonical
+evidence belongs at the referenced location rather than in the bus log.
+
 A sender that knows how far it has consumed its own inbox can include
 `--seen-peer-sequence N`. Agent Bus snapshots the sequence available at send
 time and annotates the message `stale_premise` when unread peer messages were
@@ -96,6 +109,21 @@ returns after the timeout; it never wakes another process or sends keystrokes.
 Codex cannot be woken after an ended turn without external product support,
 although a Claude monitor can run `watch` while its turn remains active.
 
+`inbox --actionable` is a compact, read-only view over that consumer's pending
+messages. It collapses explicit supersedes chains; a withdrawal closes its
+target, a replying verdict closes its local ask, and a matching `run-ended`
+closes `run-started`. An `ack`, `status`, or `fyi` is chatter and never closes
+work. Each unresolved row retains its exact head, sender, newest sequence,
+transition count, and raw sequence anchors. Malformed lines remain visible as
+issues. The command never advances the cursor and its batch token covers the
+entire raw pending range, including chatter omitted from the compact view.
+
+`watch --actionable` is also cursor-neutral and model-free. It baselines the
+current actionable set, ignores appended chatter, and emits only after that set
+changes. Run `inbox --actionable` once before starting the watcher so existing
+work is not mistaken for a new change. Restarting a watcher does not repeatedly
+emit the same unresolved set.
+
 ## Safe consumer and wake pattern
 
 Delivery and wake-up are separate. `agent-bus send`, `inbox`, and `watch` are
@@ -104,10 +132,12 @@ wait safely in an inbox after the recipient agent's turn has ended.
 
 A model adapter should use this transaction:
 
-1. Run `inbox --peek --json` and exit without invoking a model when it is empty.
-2. Give the exact returned batch to the harness as untrusted pointers.
+1. Run `inbox --peek --batch --json` (or `inbox --actionable --json`) and exit
+   without invoking a model when it has no work.
+2. Give the exact returned messages or actionable rows to the harness as
+   untrusted pointers.
 3. Independently verify canonical evidence and complete the bounded work.
-4. Only on success, run `ack --through <last-sequence-in-that-batch>`.
+4. Only on success, run `ack --batch <returned-token>`.
 
 Do not call a cursor-advancing `inbox` before model work: a crash would lose the
 batch, and a second drain after work could accidentally acknowledge messages

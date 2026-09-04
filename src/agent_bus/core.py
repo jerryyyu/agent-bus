@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import errno
 import fcntl
 import hashlib
@@ -23,6 +24,11 @@ KINDS = frozenset(
     ("ask-ready", "ask-withdrawn", "receipt-sealed", "run-started",
      "run-ended", "verdict", "blocker", "ruling", "task-ready",
      "result-ready", "status", "error", "fyi", "ack")
+)
+CHATTER_KINDS = frozenset(("ack", "status", "fyi"))
+ACTIONABLE_KINDS = frozenset(
+    ("ask-ready", "receipt-sealed", "run-started", "run-ended", "verdict",
+     "blocker", "ruling", "task-ready", "result-ready", "error")
 )
 OPTIONAL_TEXT = frozenset(("head", "verdict", "ledger", "note"))
 OPTIONAL_LINKS = frozenset(("reply_to", "supersedes"))
@@ -87,6 +93,52 @@ class Message:
         return (self.seen_peer_sequence is not None
                 and self.peer_sequence_at_send is not None
                 and self.seen_peer_sequence < self.peer_sequence_at_send)
+
+
+@dataclass(frozen=True)
+class InboxBatch:
+    """Opaque acknowledgement token and human-readable range metadata."""
+
+    token: str
+    recipient: str
+    consumer: str
+    start_sequence: int
+    end_sequence: int
+    message_count: int
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "token": self.token,
+            "recipient": self.recipient,
+            "consumer": self.consumer,
+            "start_sequence": self.start_sequence,
+            "end_sequence": self.end_sequence,
+            "message_count": self.message_count,
+        }
+
+
+@dataclass(frozen=True)
+class ActionableItem:
+    """One conservative unresolved item derived from pending raw messages."""
+
+    kind: str
+    ref: str
+    head: str | None
+    sender: str
+    newest_sequence: int
+    collapsed_transition_count: int
+    sequence_anchors: tuple[str, ...]
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "ref": self.ref,
+            "head": self.head,
+            "sender": self.sender,
+            "newest_sequence": self.newest_sequence,
+            "collapsed_transition_count": self.collapsed_transition_count,
+            "sequence_anchors": list(self.sequence_anchors),
+        }
 
 
 def _canonical(data: dict[str, Any]) -> bytes:
@@ -304,6 +356,160 @@ def _validated_index(raw: bytes, *, to_peer: str) -> list[tuple[int, Message]]:
             result.append((end, message))
     except BusError:
         raise
+    return result
+
+
+def _scan_pending(raw: bytes, *, to_peer: str, offset: int) -> tuple[
+        list[tuple[int, Message]], list[Message], list[str], int]:
+    """Validate a recipient log and return its valid pending prefix."""
+    index: list[tuple[int, Message]] = []
+    messages: list[Message] = []
+    issues: list[str] = []
+    next_offset = offset
+    previous = 0
+    try:
+        for end, line in _line_records(raw, 0):
+            if not line.strip():
+                issues.append(f"malformed blank line at byte {end - 1}")
+                break
+            try:
+                data = json.loads(line.decode("ascii"))
+                message = _validate_message(
+                    data, expected_to=to_peer, previous=previous)
+            except (UnicodeDecodeError, json.JSONDecodeError, BusError) as exc:
+                issues.append(
+                    f"malformed message at byte {end - len(line) - 1}: {exc}")
+                break
+            previous = message.sequence
+            index.append((end, message))
+            if end > offset:
+                messages.append(message)
+                next_offset = end
+            elif end == offset:
+                next_offset = end
+    except BusError as exc:
+        issues.append(str(exc))
+    if offset > len(raw):
+        issues.append("cursor is beyond log end")
+    elif offset and raw[offset - 1:offset] != b"\n":
+        issues.append("cursor does not point to a line boundary")
+    return index, messages, issues, next_offset
+
+
+_BATCH_PREFIX = "agent-bus-batch-v1."
+_BATCH_FIELDS = frozenset((
+    "schema", "recipient", "consumer", "start_offset", "start_sequence",
+    "end_offset", "end_sequence", "device", "inode", "digest"))
+
+
+def _batch_digest(payload: dict[str, Any], message_hashes: list[str]) -> str:
+    bound = {
+        key: payload[key] for key in payload
+        if key not in ("schema", "digest")
+    }
+    bound["message_sha256s"] = message_hashes
+    return hashlib.sha256(_canonical(bound)).hexdigest()
+
+
+def _encode_batch_token(payload: dict[str, Any]) -> str:
+    encoded = base64.urlsafe_b64encode(_canonical(payload)).decode("ascii")
+    return _BATCH_PREFIX + encoded.rstrip("=")
+
+
+def _decode_batch_token(token: str) -> dict[str, Any]:
+    if (not isinstance(token, str) or not token.startswith(_BATCH_PREFIX)
+            or len(token) > 2048):
+        raise BusError("invalid batch token")
+    encoded = token[len(_BATCH_PREFIX):]
+    try:
+        padding = "=" * (-len(encoded) % 4)
+        raw = base64.b64decode(
+            encoded + padding, altchars=b"-_", validate=True)
+        payload = json.loads(raw.decode("ascii"))
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise BusError("invalid batch token") from exc
+    if not isinstance(payload, dict) or set(payload) != _BATCH_FIELDS:
+        raise BusError("invalid batch token fields")
+    if payload["schema"] != "agent-bus/inbox-batch-v1":
+        raise BusError("unsupported batch token")
+    for key in ("recipient", "consumer"):
+        _check_name(payload[key], f"batch {key}")
+    for key in ("start_offset", "start_sequence", "end_offset",
+                "end_sequence", "device", "inode"):
+        value = payload[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise BusError("invalid batch token range")
+    if (payload["end_offset"] <= payload["start_offset"]
+            or payload["end_sequence"] <= payload["start_sequence"]):
+        raise BusError("invalid batch token range")
+    if (not isinstance(payload["digest"], str)
+            or not re.fullmatch(r"[0-9a-f]{64}", payload["digest"])):
+        raise BusError("invalid batch token digest")
+    return payload
+
+
+def _actionable_items(messages: list[Message]) -> list[ActionableItem]:
+    """Reduce one recipient's pending messages without optimistic closure."""
+    if not messages:
+        return []
+    nodes = {f"{message.to_peer}:{message.sequence}": message
+             for message in messages}
+    superseded: set[str] = set()
+    closed: set[str] = set()
+    local_closers: set[str] = set()
+
+    # Explicit replacements hide only the exact message they replace. A reply
+    # to an older chain member must not close a newer successor. Chatter is
+    # deliberately incapable of replacing or closing an ask.
+    for anchor, message in nodes.items():
+        if (message.supersedes in nodes
+                and message.kind not in CHATTER_KINDS):
+            superseded.add(message.supersedes)
+
+    # Link only the named exact close transitions. A generic reply and an ack
+    # are delivery context, not proof that the underlying work is resolved.
+    for anchor, message in nodes.items():
+        if (message.kind == "ask-withdrawn"
+                and (message.reply_to in nodes
+                     or message.supersedes in nodes)):
+            target = (message.reply_to if message.reply_to in nodes
+                      else message.supersedes)
+            assert target is not None
+            closed.add(target)
+            local_closers.add(anchor)
+        elif message.kind == "verdict" and message.reply_to in nodes:
+            closed.add(message.reply_to)
+            local_closers.add(anchor)
+    run_starts: dict[str, list[str]] = {}
+    for anchor, message in nodes.items():
+        if message.kind == "run-started":
+            run_starts.setdefault(message.ref, []).append(anchor)
+        elif message.kind == "run-ended":
+            eligible = [candidate for candidate in run_starts.get(
+                message.ref, []) if nodes[candidate].sequence < message.sequence]
+            if eligible:
+                closed.add(eligible[-1])
+                local_closers.add(anchor)
+
+    result: list[ActionableItem] = []
+    for anchor, message in nodes.items():
+        if (anchor in superseded or anchor in closed or anchor in local_closers
+                or message.kind not in ACTIONABLE_KINDS):
+            continue
+        ancestry = [anchor]
+        prior = message.supersedes
+        seen = {anchor}
+        while prior in nodes and prior not in seen:
+            ancestry.append(prior)
+            seen.add(prior)
+            prior = nodes[prior].supersedes
+        ancestry.sort(key=lambda item: nodes[item].sequence)
+        result.append(ActionableItem(
+            kind=message.kind, ref=message.ref, head=message.head,
+            sender=message.from_peer, newest_sequence=message.sequence,
+            collapsed_transition_count=len(ancestry) - 1,
+            sequence_anchors=tuple(ancestry)))
+    result.sort(key=lambda item: item.newest_sequence)
     return result
 
 
@@ -539,35 +745,8 @@ class Bus:
             fcntl.flock(fd, fcntl.LOCK_EX)
             raw = os.pread(fd, os.fstat(fd).st_size, 0)
             offset = self._read_cursor(cursor)
-            messages: list[Message] = []
-            issues: list[str] = []
-            next_offset = offset
-            previous = 0
-            # Validate sequence continuity from the beginning, while only returning new records.
-            try:
-                records = _line_records(raw, 0)
-                for end, line in records:
-                    if not line.strip():
-                        issues.append(f"malformed blank line at byte {end - 1}")
-                        break
-                    try:
-                        data = json.loads(line.decode("ascii"))
-                        msg = _validate_message(data, expected_to=to_peer, previous=previous)
-                        previous = msg.sequence
-                    except (UnicodeDecodeError, json.JSONDecodeError, BusError) as exc:
-                        issues.append(f"malformed message at byte {end - len(line) - 1}: {exc}")
-                        break
-                    if end > offset:
-                        messages.append(msg)
-                        next_offset = end
-                    elif end == offset:
-                        next_offset = end
-            except BusError as exc:
-                issues.append(str(exc))
-            if offset > len(raw):
-                issues.append("cursor is beyond log end")
-            elif offset and offset <= len(raw) and raw[offset - 1:offset] != b"\n":
-                issues.append("cursor does not point to a line boundary")
+            _index, messages, issues, next_offset = _scan_pending(
+                raw, to_peer=to_peer, offset=offset)
             if not peek and not issues and next_offset != offset:
                 self._write_cursor(cursor, next_offset)
             return messages, issues
@@ -576,6 +755,61 @@ class Bus:
                 fcntl.flock(fd, fcntl.LOCK_UN)
             finally:
                 os.close(fd)
+
+    def peek_batch(self, to_peer: str, consumer: str) -> tuple[
+            list[Message], list[str], InboxBatch | None]:
+        """Peek pending messages and bind the exact range to a stateless token."""
+        self._require_init()
+        to_peer = _check_name(to_peer, "recipient")
+        consumer = _check_name(consumer, "consumer")
+        log = self.state_dir / "inboxes" / f"{to_peer}.jsonl"
+        if not log.exists() and not log.is_symlink():
+            _ensure_file(log, "inbox log")
+        cursor = self._cursor_path(to_peer, consumer)
+        fd = _safe_open_log(log)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            info = os.fstat(fd)
+            raw = os.pread(fd, info.st_size, 0)
+            offset = self._read_cursor(cursor)
+            index, messages, issues, next_offset = _scan_pending(
+                raw, to_peer=to_peer, offset=offset)
+            if issues or not messages:
+                return messages, issues, None
+            by_end = {end: message for end, message in index}
+            if offset and offset not in by_end:
+                return messages, ["cursor does not identify a complete message"], None
+            start_message = by_end.get(offset)
+            payload: dict[str, Any] = {
+                "schema": "agent-bus/inbox-batch-v1",
+                "recipient": to_peer,
+                "consumer": consumer,
+                "start_offset": offset,
+                "start_sequence": start_message.sequence if start_message else 0,
+                "end_offset": next_offset,
+                "end_sequence": messages[-1].sequence,
+                "device": info.st_dev,
+                "inode": info.st_ino,
+            }
+            payload["digest"] = _batch_digest(
+                payload, [message.message_sha256 for message in messages])
+            token = _encode_batch_token(payload)
+            return messages, issues, InboxBatch(
+                token=token, recipient=to_peer, consumer=consumer,
+                start_sequence=payload["start_sequence"],
+                end_sequence=payload["end_sequence"],
+                message_count=len(messages))
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+    def actionable_inbox(self, to_peer: str, consumer: str) -> tuple[
+            list[ActionableItem], list[str], InboxBatch | None]:
+        """Return a compact, cursor-neutral view of unresolved pending items."""
+        messages, issues, batch = self.peek_batch(to_peer, consumer)
+        return _actionable_items(messages), issues, batch
 
     def ack(self, to_peer: str, consumer: str, *,
             through_sequence: int) -> dict[str, int]:
@@ -620,6 +854,62 @@ class Bus:
             return {"acked_sequence": through_sequence,
                     "offset": target_offset,
                     "pending_count": len(index) - through_sequence}
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+    def ack_batch(self, to_peer: str, consumer: str, *,
+                  token: str) -> dict[str, int]:
+        """Verify and acknowledge only the exact range represented by token."""
+        self._require_init()
+        to_peer = _check_name(to_peer, "recipient")
+        consumer = _check_name(consumer, "consumer")
+        payload = _decode_batch_token(token)
+        if (payload["recipient"] != to_peer
+                or payload["consumer"] != consumer):
+            raise BusError("batch token recipient or consumer mismatch")
+        log = self.state_dir / "inboxes" / f"{to_peer}.jsonl"
+        if not log.exists() and not log.is_symlink():
+            raise BusError("batch inbox log is missing")
+        cursor = self._cursor_path(to_peer, consumer)
+        fd = _safe_open_log(log)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            info = os.fstat(fd)
+            if (info.st_dev != payload["device"]
+                    or info.st_ino != payload["inode"]):
+                raise BusError("batch inbox log was rotated")
+            raw = os.pread(fd, info.st_size, 0)
+            index = _validated_index(raw, to_peer=to_peer)
+            offset = self._read_cursor(cursor)
+            if offset != payload["start_offset"]:
+                raise BusError("batch cursor changed after peek")
+            by_end = {end: message for end, message in index}
+            start_message = by_end.get(offset)
+            start_sequence = start_message.sequence if start_message else 0
+            if start_sequence != payload["start_sequence"]:
+                raise BusError("batch start sequence drift")
+            if payload["end_offset"] not in by_end:
+                raise BusError("batch end is missing or rewritten")
+            selected = [
+                message for end, message in index
+                if offset < end <= payload["end_offset"]]
+            if (not selected
+                    or selected[-1].sequence != payload["end_sequence"]
+                    or selected[0].sequence != start_sequence + 1):
+                raise BusError("batch sequence range drift")
+            recomputed = _batch_digest(
+                payload, [message.message_sha256 for message in selected])
+            if recomputed != payload["digest"]:
+                raise BusError("batch token verification failed")
+            self._write_cursor(cursor, payload["end_offset"])
+            return {
+                "acked_sequence": payload["end_sequence"],
+                "offset": payload["end_offset"],
+                "pending_count": len(index) - payload["end_sequence"],
+            }
         finally:
             try:
                 fcntl.flock(fd, fcntl.LOCK_UN)
@@ -757,3 +1047,47 @@ class Bus:
                 return all_messages, all_issues
             remaining = None if timeout is None else max(0.0, timeout - (time.monotonic() - started))
             time.sleep(poll_interval if remaining is None else min(poll_interval, remaining))
+
+    def watch_actionable(self, to_peer: str, consumer: str, *,
+                         timeout: float | None = None,
+                         poll_interval: float = 1.0) -> tuple[
+                             list[ActionableItem], list[str],
+                             InboxBatch | None, bool]:
+        """Wait for the actionable set to change without advancing a cursor.
+
+        Callers should inspect ``actionable_inbox`` once before entering this
+        passive watch. The baseline is the current set, so chatter appended
+        after startup does not wake the consumer.
+        """
+        if (timeout is not None
+                and (not isinstance(timeout, (int, float))
+                     or isinstance(timeout, bool)
+                     or not math.isfinite(timeout) or timeout < 0)):
+            raise BusError("timeout must be finite and non-negative")
+        if (not isinstance(poll_interval, (int, float))
+                or isinstance(poll_interval, bool)
+                or not math.isfinite(poll_interval) or poll_interval <= 0):
+            raise BusError("poll interval must be finite and positive")
+
+        def signature(items: list[ActionableItem], issues: list[str]) -> bytes:
+            return _canonical({
+                "items": [item.as_dict() for item in items],
+                "issues": issues,
+            })
+
+        started = time.monotonic()
+        items, issues, batch = self.actionable_inbox(to_peer, consumer)
+        baseline = signature(items, issues)
+        if issues:
+            return items, issues, batch, True
+        while True:
+            if timeout is not None and time.monotonic() - started >= timeout:
+                return [], [], None, False
+            remaining = None if timeout is None else max(
+                0.0, timeout - (time.monotonic() - started))
+            time.sleep(poll_interval if remaining is None else min(
+                poll_interval, remaining))
+            items, issues, batch = self.actionable_inbox(to_peer, consumer)
+            current = signature(items, issues)
+            if current != baseline:
+                return items, issues, batch, True
