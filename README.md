@@ -26,6 +26,20 @@ Agent names are configurable; projects do not need to use Git.
 connect machines, authenticate agents, or grant permission to merge/deploy.
 Bus messages stay local; your agents' model traffic follows their normal providers.
 
+## Example applications
+
+| Workflow | Example exchange | Where the work lives |
+| --- | --- | --- |
+| PR review | Codex requests a review; Claude returns findings for that commit. | PR diff and review comment |
+| Implementation handoff | One agent defines the task and owned files; another implements it. | Issue and branch |
+| Debugging consultation | An agent shares a failing test; a peer returns a diagnosis. | Reproduction and logs |
+| Long-running jobs | A runner announces completion or failure; an agent checks the result. | Job summary and result files |
+| Other models | Claude or Codex hands a task to a local-model harness. | Shared project artifacts |
+
+These are workflows you arrange, not bundled automations. Names such as
+`qwen-local` work unchanged; the harness needs CLI access and a way to read its
+inbox. The bus doesn't launch tasks, lock files, or grant permission to act.
+
 ## Quick start: Codex asks Claude for a review
 
 Install with [uv](https://docs.astral.sh/uv/):
@@ -120,14 +134,6 @@ agent-bus ack --project "$BUS_PROJECT" --to claude \
 Only acknowledge after handling the entire batch. New arrivals remain pending.
 If work is blocked, leave it pending rather than acknowledging it to silence
 the inbox. Codex reads and acknowledges the reply the same way.
-
-## Other uses
-
-- **Job updates:** a runner sends `--kind run-ended --ref /path/to/results`.
-- **Implementation handoffs:** send `--kind task-ready` with an issue defining
-  the task and owned files. The bus doesn't launch it or lock those files.
-- **Other models:** names such as `qwen-local` work unchanged. The harness needs
-  CLI access and a way to read its inbox; model-specific adapters aren't included.
 
 ## Teach your agents the workflow
 
