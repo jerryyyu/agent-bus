@@ -25,6 +25,7 @@ A = "a" * 40
 B = "b" * 40
 C = "c" * 40
 PR = "https://github.com/owner/repo/pull/680"
+OTHER_REPO_DEP = "https://github.com/owner/other/pull/670"
 PR_COMMENT = PR + "#issuecomment-123"
 DEP = "https://github.com/owner/repo/pull/670"
 DEP_COMMENT = DEP + "#issuecomment-9"
@@ -49,10 +50,10 @@ class CoordinationTests(unittest.TestCase):
         self.common = ["--project", str(self.project),
                        "--state-root", str(self.state)]
         self.saved_env = os.environ.pop("AGENT_BUS_STRICT", None)
-        # Both agents have read their inboxes with this version, which is
-        # what lets a sender append version 3 lines to them.
+        # Both agents have consumed their inboxes with this version, which
+        # is what lets a sender append version 3 lines to them.
         for peer in ("claude", "codex"):
-            self.bus.inbox(peer, "setup", peek=True)
+            self.bus.inbox(peer, "setup")
 
     def tearDown(self) -> None:
         if self.saved_env is not None:
@@ -288,6 +289,65 @@ class CoordinationTests(unittest.TestCase):
         self.assertEqual([(item.ref, item.blocked_on) for item in items],
                          [(DEP, None), (PR, "670")])
 
+    def test_late_pass_at_the_old_head_stays_stale_and_blocks_dependents(self) -> None:
+        self.bus.send("codex", "claude", "ask-ready", DEP, head=A)
+        self.bus.send("codex", "claude", "ask-ready", PR, head=C,
+                      depends_on="670")
+        self.bus.send("codex", "claude", "head-moved", DEP, head=B, prev_head=A)
+        # A delayed PASS naming the old head arrives after the move.
+        self.bus.send("claude", "codex", "verdict", DEP_COMMENT, verdict="PASS",
+                      head=A)
+        thread, _issues = self.bus.thread(DEP)
+        self.assertEqual([m.stale_head for m in thread if m.kind == "verdict"],
+                         [B])
+        items, _issues, _batch = self.bus.actionable_inbox("claude", "r")
+        self.assertEqual([(item.ref, item.head, item.blocked_on) for item in items],
+                         [(DEP, B, None), (PR, C, "670")])
+        items, _issues, _batch = self.bus.actionable_inbox("codex", "r")
+        self.assertEqual([(item.kind, item.stale_head) for item in items],
+                         [("verdict", B)])
+        # A PASS at the current head is current and releases the dependent.
+        self.bus.send("claude", "codex", "verdict", DEP_COMMENT, verdict="PASS",
+                      head=B)
+        thread, _issues = self.bus.thread(DEP)
+        self.assertEqual([m.stale_head for m in thread if m.kind == "verdict"],
+                         [B, None])
+        items, _issues, _batch = self.bus.actionable_inbox("claude", "r")
+        self.assertEqual([(item.ref, item.blocked_on) for item in items],
+                         [(PR, None), (DEP, None)])
+        # A verdict naming a head the thread was never asked at is not current.
+        self.bus.send("claude", "codex", "verdict", PR_COMMENT, verdict="PASS",
+                      head=A)
+        thread, _issues = self.bus.thread(PR)
+        self.assertEqual([m.stale_head for m in thread if m.kind == "verdict"],
+                         [C])
+
+    def test_numeric_dependency_resolves_in_the_asking_refs_repository(self) -> None:
+        self.bus.send("codex", "claude", "ask-ready", PR, head=A,
+                      depends_on="670")
+        # A PASS on #670 of another repository does not count.
+        self.bus.send("claude", "codex", "verdict",
+                      OTHER_REPO_DEP + "#issuecomment-1", verdict="PASS", head=C)
+        items, _issues, _batch = self.bus.actionable_inbox("claude", "r")
+        self.assertEqual(items[0].blocked_on, "670")
+        self.bus.send("claude", "codex", "verdict", DEP_COMMENT, verdict="PASS",
+                      head=C)
+        items, _issues, _batch = self.bus.actionable_inbox("claude", "r")
+        self.assertEqual(items[0].blocked_on, None)
+        # A full URL dependency is matched exactly, across repositories.
+        self.bus.send("codex", "claude", "ask-ready", "runs/x", head=A,
+                      depends_on=OTHER_REPO_DEP)
+        items, _issues, _batch = self.bus.actionable_inbox("claude", "r")
+        self.assertEqual([item.blocked_on for item in items], [None, None])
+        # A bare number has no repository to resolve in when the ref is not
+        # a GitHub PR or issue URL.
+        with self.assertRaisesRegex(BusError, "numeric --depends-on"):
+            self.bus.send("codex", "claude", "ask-ready", "runs/x", head=A,
+                          depends_on="670")
+        self.assertTrue(same_thread("670", OTHER_REPO_DEP))
+        self.assertFalse(same_thread("670", OTHER_REPO_DEP,
+                                     repo="https://github.com/owner/repo"))
+
     def test_dependency_by_url_matches_comment_verdicts(self) -> None:
         self.bus.send("codex", "claude", "ask-ready", PR, head=A,
                       depends_on=DEP)
@@ -434,6 +494,28 @@ class CoordinationTests(unittest.TestCase):
                 "send", *self.common, "--from", "codex", "--to", "claude",
                 "--kind", "fyi", "--ref", PR, "--json"])
             self.assertNotIn("head", json.loads(output)["message"])
+            # An inherited GIT_DIR pointing at another repository must not
+            # select that repository's head.
+            other = Path(self.temp.name) / "other"
+            other.mkdir()
+            for command in (["git", "init", "-q"],
+                            ["git", "commit", "-q", "--allow-empty", "-m", "x"]):
+                subprocess.run(command, cwd=other, env=env, check=True)
+            other_head = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=other, env=env, check=True,
+                capture_output=True, text=True).stdout.strip()
+            self.assertNotEqual(other_head, head)
+            os.environ["GIT_DIR"] = str(other / ".git")
+            os.environ["GIT_WORK_TREE"] = str(other)
+            try:
+                code, output, _error = invoke([
+                    "send", *self.common, "--from", "codex", "--to", "claude",
+                    "--kind", "ask-ready", "--ref", PR, "--json"])
+                self.assertEqual(code, 0)
+                self.assertEqual(json.loads(output)["message"]["head"], head)
+            finally:
+                del os.environ["GIT_DIR"]
+                del os.environ["GIT_WORK_TREE"]
         finally:
             os.chdir(previous)
         os.chdir(self.temp.name)
@@ -460,15 +542,33 @@ class CoordinationTests(unittest.TestCase):
         forced = fresh.send("codex", "claude", "ask-ready", PR, head=A,
                             depends_on="670", assume_peer_upgraded=True)
         self.assertEqual(forced.version, COORDINATION_VERSION)
+        # Diagnostic reads never mark: a human may peek while an older
+        # automation is still the one consuming the inbox.
         fresh.inbox("claude", "claude-session", peek=True)
+        fresh.peek_batch("claude", "claude-session")
+        fresh.actionable_inbox("claude", "claude-session")
+        self.assertEqual(fresh.peer_reader_version("claude"), None)
+        with self.assertRaisesRegex(BusError, "has not read this project"):
+            fresh.send("codex", "claude", "head-moved", PR, head=B,
+                       prev_head=A)
+        # A cursor-advancing read is made by the consumer itself.
+        messages, issues = fresh.inbox("claude", "claude-session")
+        self.assertFalse(issues)
+        self.assertEqual([m.version for m in messages], [2, 3])
         self.assertEqual(fresh.peer_reader_version("claude"), "0.4.0")
         self.assertEqual(fresh.peer_reader_version("codex"), None)
         allowed = fresh.send("codex", "claude", "head-moved", PR, head=B,
                              prev_head=A)
         self.assertEqual(allowed.version, COORDINATION_VERSION)
-        messages, issues = fresh.inbox("claude", "claude-session", peek=True)
-        self.assertFalse(issues)
-        self.assertEqual([m.version for m in messages], [2, 3, 3])
+        # So is an acknowledgement of a peeked batch.
+        fresh.send("claude", "codex", "fyi", "x")
+        _messages, _issues, batch = fresh.peek_batch("codex", "codex-session")
+        self.assertEqual(fresh.peer_reader_version("codex"), None)
+        assert batch is not None
+        fresh.ack_batch("codex", "codex-session", token=batch.token)
+        self.assertEqual(fresh.peer_reader_version("codex"), "0.4.0")
+        fresh.send("claude", "codex", "fyi", "y")
+        fresh.ack("codex", "codex-session", through_sequence=2)
         self.assertEqual(fresh.doctor(), ["ok"])
 
     def test_log_ref_filters_and_follows_one_thread(self) -> None:

@@ -68,7 +68,7 @@ STRICT_ENV = "AGENT_BUS_STRICT"
 # older reader would report as malformed.
 READER_VERSION = "0.4.0"
 _GITHUB_THREAD = re.compile(
-    r"^(https?://[^\s#?]+?/(?:pull|issues)/([0-9]+))", re.IGNORECASE)
+    r"^((https?://[^\s#?]+?)/(?:pull|issues)/([0-9]+))", re.IGNORECASE)
 _PR_NUMBER = re.compile(r"^#?([1-9][0-9]{0,9})$")
 
 
@@ -91,16 +91,27 @@ def thread_key(ref: str) -> str:
     return ref.split("#", 1)[0]
 
 
-def same_thread(query: str, ref: str) -> bool:
+def repo_of(ref: str) -> str | None:
+    """The repository URL a GitHub PR/issue ref belongs to, lowercased."""
+    match = _GITHUB_THREAD.match(ref)
+    return match.group(2).lower() if match else None
+
+
+def same_thread(query: str, ref: str, *, repo: str | None = None) -> bool:
     """Whether ``ref`` belongs to the thread named by ``query``.
 
     ``query`` may be a ref (threaded like ``thread_key``) or a bare PR/issue
-    number such as ``680`` or ``#680``.
+    number such as ``680`` or ``#680``. A bare number is scoped to ``repo``
+    when one is given (a dependency resolves inside the asking ref's own
+    repository); without ``repo`` it matches that number in any repository,
+    which is what an interactive ``log --ref 680`` wants.
     """
     number = _PR_NUMBER.match(query.strip())
     if number:
         match = _GITHUB_THREAD.match(ref)
-        return bool(match) and match.group(2) == number.group(1)
+        if not match or match.group(3) != number.group(1):
+            return False
+        return repo is None or match.group(2).lower() == repo
     return thread_key(query) == thread_key(ref)
 
 
@@ -447,6 +458,12 @@ def _check_kind_shape(data: dict[str, Any]) -> None:
         if not re.match(r"^https?://", data["ref"], re.IGNORECASE):
             raise BusError(
                 "decision requires --ref pointing at the comment URL where the human decided")
+    dependency = data.get("depends_on")
+    if (dependency is not None and _PR_NUMBER.match(dependency.strip())
+            and repo_of(data["ref"]) is None):
+        raise BusError(
+            "a numeric --depends-on resolves inside the ref's own repository; "
+            "give a full PR URL when --ref is not a GitHub PR or issue URL")
     if "action" in data and kind != "host" and data["action"] not in HOST_ACTIONS:
         raise BusError("invalid message action")
 
@@ -623,41 +640,50 @@ def _chronological(message: Message) -> tuple[str, str, int, str, str]:
             message.from_peer, message.message_sha256)
 
 
-def _moved_head(message: Message, after: Message) -> str | None:
-    """The head a later message reports for a thread, if it differs.
+def _current_head(thread: list[Message]) -> str | None:
+    """The head a thread is at now: the latest ask-ready or head-moved head."""
+    current = None
+    for message in thread:
+        if message.kind in ("ask-ready", "head-moved") and message.head is not None:
+            current = message.head
+    return current
 
-    A ``head-moved`` always moves the thread (an unheaded verdict cannot be
-    shown to match, so it is stale too). A later ``ask-ready`` only counts
-    when both heads are present and differ: a re-ask at the same commit is
-    a nudge, not a rebase.
+
+def _verdict_stale_head(verdict: Message, thread: list[Message]) -> str | None:
+    """The head that makes ``verdict`` stale, if any.
+
+    A verdict that names a head is stale whenever the thread's current head
+    (the latest ask-ready or head-moved head) differs from it, regardless of
+    message order: a PASS at A that arrives after the thread moved to B does
+    not become current. A verdict without a head cannot be compared, so it
+    is stale only once a head-moved follows it; a later re-ask alone is a
+    nudge, not a rebase.
     """
-    if message.kind == "head-moved" and message.head != after.head:
-        return message.head
-    if (message.kind == "ask-ready" and message.head is not None
-            and after.head is not None and message.head != after.head):
-        return message.head
-    return None
+    current = _current_head(thread)
+    if verdict.head is not None:
+        return current if current is not None and current != verdict.head else None
+    after = False
+    moved = None
+    for message in thread:
+        if message is verdict:
+            after = True
+        elif after and message.kind == "head-moved":
+            moved = message.head
+    return moved
 
 
 def annotate_stale(messages: list[Message]) -> list[Message]:
-    """Mark verdicts that a later head move in the same thread invalidated."""
+    """Mark verdicts whose thread is not at the head they reviewed."""
     ordered = sorted(messages, key=_chronological)
     by_key: dict[str, list[Message]] = {}
     for message in ordered:
         by_key.setdefault(thread_key(message.ref), []).append(message)
     stale: dict[str, str | None] = {}
     for thread in by_key.values():
-        if not any(message.kind == "verdict" for message in thread):
-            continue
-        for position, message in enumerate(thread):
-            if message.kind != "verdict":
-                continue
-            moved_to = None
-            for later in thread[position + 1:]:
-                moved = _moved_head(later, message)
-                if moved is not None:
-                    moved_to = moved
-            stale[message.message_sha256] = moved_to
+        for message in thread:
+            if message.kind == "verdict":
+                stale[message.message_sha256] = _verdict_stale_head(
+                    message, thread)
     return [replace(message, stale_head=stale[message.message_sha256])
             if (message.message_sha256 in stale
                 and stale[message.message_sha256] != message.stale_head)
@@ -665,14 +691,16 @@ def annotate_stale(messages: list[Message]) -> list[Message]:
             for message in ordered]
 
 
-def _dependency_satisfied(dependency: str, annotated: list[Message]) -> bool:
+def _dependency_satisfied(dependency: str, repo: str | None,
+                          annotated: list[Message]) -> bool:
     """Whether the latest verdict on the dependency is a current PASS.
 
-    ``annotated`` is the project context after ``annotate_stale``.
+    ``annotated`` is the project context after ``annotate_stale``; a bare
+    PR number resolves inside ``repo``, the asking ref's own repository.
     """
     verdicts = [message for message in annotated
                 if message.kind == "verdict"
-                and same_thread(dependency, message.ref)]
+                and same_thread(dependency, message.ref, repo=repo)]
     if not verdicts:
         return False
     latest = max(verdicts, key=_chronological)
@@ -793,7 +821,8 @@ def _actionable_items(messages: list[Message],
         blocked_on = None
         if (message.kind in ("ask-ready", "task-ready")
                 and message.depends_on is not None
-                and not _dependency_satisfied(message.depends_on, annotated)):
+                and not _dependency_satisfied(
+                    message.depends_on, repo_of(message.ref), annotated)):
             blocked_on = message.depends_on
         detail = {key: getattr(message, key)
                   for key in ("verdict", "depends_on", "host", "action",
@@ -899,11 +928,14 @@ class Bus:
         return self.state_dir / "peers" / f"{len(peer)}-{peer}.reader"
 
     def _record_reader(self, to_peer: str) -> None:
-        """Remember that ``to_peer`` was read by a 0.4.0+ reader.
+        """Remember that ``to_peer`` was consumed by a 0.4.0+ reader.
 
-        Senders consult this before appending a version 3 line: a 0.3.0
-        reader reports unknown kinds and fields as malformed and its inbox
-        then blocks at that line until it is upgraded.
+        Only a cursor-advancing read or an acknowledgement counts: those are
+        made by the automation that actually consumes the inbox. A peek or
+        actionable view is diagnostic and may come from a human while an
+        older automation still reads the same inbox. Senders consult the
+        marker before appending a version 3 line, which a 0.3.0 reader
+        reports as malformed and then blocks on until it is upgraded.
         """
         peers = self.state_dir / "peers"
         if not peers.exists() and not peers.is_symlink():
@@ -1113,7 +1145,8 @@ class Bus:
                 raw, to_peer=to_peer, offset=offset)
             if not peek and not issues and next_offset != offset:
                 self._write_cursor(cursor, next_offset)
-            self._record_reader(to_peer)
+            if not peek:
+                self._record_reader(to_peer)
             return messages, issues
         finally:
             try:
@@ -1139,7 +1172,6 @@ class Bus:
             offset = self._read_cursor(cursor)
             index, messages, issues, next_offset = _scan_pending(
                 raw, to_peer=to_peer, offset=offset)
-            self._record_reader(to_peer)
             if issues or not messages:
                 return messages, issues, None
             by_end = {end: message for end, message in index}
@@ -1249,6 +1281,7 @@ class Bus:
             target_offset = targets[0][0]
             if through_sequence > current_sequence:
                 self._write_cursor(cursor, target_offset)
+            self._record_reader(to_peer)
             return {"acked_sequence": through_sequence,
                     "offset": target_offset,
                     "pending_count": len(index) - through_sequence}
@@ -1303,6 +1336,7 @@ class Bus:
             if recomputed != payload["digest"]:
                 raise BusError("batch token verification failed")
             self._write_cursor(cursor, payload["end_offset"])
+            self._record_reader(to_peer)
             return {
                 "acked_sequence": payload["end_sequence"],
                 "offset": payload["end_offset"],

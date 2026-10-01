@@ -10,9 +10,13 @@ import time
 from typing import Any
 
 from .core import (ActionableItem, Bus, BusError, FULL_HEAD, HOST_ACTIONS,
-                   InboxBatch, Message, same_thread, strict_default)
+                   InboxBatch, Message, strict_default)
 
 AUTO_HEAD_KINDS = frozenset(("ask-ready", "verdict"))
+GIT_LOCATION_ENV = frozenset((
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE"))
 COMPACT_FIELDS = (
     "verdict", "head", "prev_head", "depends_on", "host", "action", "pid",
     "pgid", "count", "lock", "rearm", "rc", "receipt", "reason", "ledger",
@@ -221,10 +225,15 @@ def _git_head() -> str | None:
     bus text. It is a convenience for the sender's own checkout and nothing
     else; pass --head when the reviewed commit lives elsewhere.
     """
+    # An inherited GIT_DIR/GIT_WORK_TREE would select another repository;
+    # the head of the current directory is the only one this means.
+    env = {key: value for key, value in os.environ.items()
+           if key not in GIT_LOCATION_ENV}
+    cwd = os.getcwd()
     try:
         completed = subprocess.run(
-            ["git", "rev-parse", "HEAD"], capture_output=True, text=True,
-            timeout=5, check=False, cwd=os.getcwd())
+            ["git", "-C", cwd, "rev-parse", "HEAD"], capture_output=True,
+            text=True, timeout=5, check=False, cwd=cwd, env=env)
     except (OSError, subprocess.SubprocessError):
         return None
     head = completed.stdout.strip()
