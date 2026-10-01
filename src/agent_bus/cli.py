@@ -3,11 +3,24 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
+import subprocess
 import sys
 import time
 from typing import Any
 
-from .core import ActionableItem, Bus, BusError, InboxBatch, Message
+from .core import (ActionableItem, Bus, BusError, FULL_HEAD, HOST_ACTIONS,
+                   InboxBatch, Message, strict_default)
+
+AUTO_HEAD_KINDS = frozenset(("ask-ready", "verdict"))
+GIT_LOCATION_ENV = frozenset((
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE"))
+COMPACT_FIELDS = (
+    "verdict", "head", "prev_head", "depends_on", "host", "action", "pid",
+    "pgid", "count", "lock", "rearm", "rc", "receipt", "reason", "ledger",
+    "reply_to", "supersedes")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -29,10 +42,46 @@ def _parser() -> argparse.ArgumentParser:
     send.add_argument("--to", dest="to_peer", required=True, help="recipient agent ID")
     send.add_argument("--kind", required=True)
     send.add_argument("--ref", required=True)
-    for name in ("head", "verdict", "ledger", "note", "reply-to",
-                 "supersedes"):
-        send.add_argument(f"--{name}")
+    send.add_argument("--head", help="full 40-hex commit sha the message is "
+                      "about; auto-filled from git rev-parse HEAD of the current "
+                      "directory for ask-ready/verdict when omitted")
+    send.add_argument("--verdict", help="PASS or HOLD on a verdict")
+    send.add_argument("--ledger", help=argparse.SUPPRESS)  # deprecated
+    send.add_argument("--note", help="one or two sentences; evidence lives at --ref")
+    send.add_argument("--reply-to")
+    send.add_argument("--supersedes")
     send.add_argument("--seen-peer-sequence", type=int)
+    coordination = send.add_argument_group(
+        "coordination fields (0.4.0; the recipient must run 0.4.0 or later)")
+    coordination.add_argument(
+        "--depends-on", help="ask-ready: ref or PR number that needs a PASS first")
+    coordination.add_argument(
+        "--prev-head", help="head-moved: the sha the thread moved away from")
+    coordination.add_argument("--reason", help="head-moved: short reason")
+    coordination.add_argument("--host", help="host: machine name")
+    coordination.add_argument(
+        "--action", choices=sorted(HOST_ACTIONS), help="host: transition")
+    coordination.add_argument("--pid", type=int, help="host: process id")
+    coordination.add_argument("--pgid", type=int, help="host: process group")
+    coordination.add_argument("--lock", help="host: lock path")
+    coordination.add_argument(
+        "--count", type=int, help="host: a count, for example shards")
+    coordination.add_argument(
+        "--rearm", help="host: the command that re-arms the job (text, never run)")
+    coordination.add_argument(
+        "--rc", type=int, help="run-ended/result-ready: exit status")
+    coordination.add_argument(
+        "--receipt", help="run-ended/result-ready: receipt path")
+    send.add_argument(
+        "--strict", action="store_true",
+        help="refuse instead of warning on contract slips (also AGENT_BUS_STRICT=1)")
+    send.add_argument(
+        "--no-auto-head", action="store_true",
+        help="never fill --head from the current git checkout")
+    send.add_argument(
+        "--assume-peer-upgraded", action="store_true",
+        help="send coordination fields even though the recipient has not "
+             "been seen reading with agent-bus 0.4.0+")
     send.add_argument("--once", action="store_true",
                       help="suppress a semantic duplicate in the recent window")
     send.add_argument("--dedupe-window", type=int, default=20)
@@ -81,6 +130,9 @@ def _parser() -> argparse.ArgumentParser:
         "log", help="merge all directions without advancing cursors")
     project_args(log)
     log.add_argument("--follow", action="store_true")
+    log.add_argument(
+        "--ref", help="show one thread: a ref, a PR URL, or a PR number; "
+                      "verdicts the thread moved away from are marked STALE")
     log.add_argument("--timeout", type=float,
                      help="bounded follow duration in seconds")
     log.add_argument("--poll-interval", type=float, default=1.0)
@@ -102,6 +154,10 @@ def _render_message(message: Message, as_json: bool, *, compact: bool = False,
         }
     if message.duplicate_suppressed:
         annotations["duplicate_suppressed"] = True
+    if message.stale_head is not None:
+        annotations["stale_verdict"] = {"head_moved_to": message.stale_head}
+    if message.warnings:
+        annotations["warnings"] = list(message.warnings)
     if as_json:
         payload: dict[str, Any] = {
             "status": "NON_AUTHORITATIVE", "message": message.as_dict()}
@@ -114,10 +170,12 @@ def _render_message(message: Message, as_json: bool, *, compact: bool = False,
         fields = [
             f"{timestamp} {message.from_peer}->{message.to_peer}",
             message.kind, message.ref]
-        for key in ("verdict", "ledger", "head", "reply_to", "supersedes"):
+        for key in COMPACT_FIELDS:
             value = getattr(message, key)
             if value is not None:
                 fields.append(f"{key}={value}")
+        if message.stale_head is not None:
+            fields.append(f"STALE(head-moved-to={message.stale_head})")
         if message.stale_premise:
             fields.append(
                 f"STALE(seen={message.seen_peer_sequence},available={message.peer_sequence_at_send})")
@@ -160,6 +218,36 @@ def _render_actionable(items: list[ActionableItem], issues: list[str],
     print(rendered if as_json else "NON_AUTHORITATIVE " + rendered)
 
 
+def _git_head() -> str | None:
+    """The checked-out commit of the current directory, if it is a repo.
+
+    This is the package's only subprocess: a fixed argv that never includes
+    bus text. It is a convenience for the sender's own checkout and nothing
+    else; pass --head when the reviewed commit lives elsewhere.
+    """
+    # An inherited GIT_DIR/GIT_WORK_TREE would select another repository;
+    # the head of the current directory is the only one this means.
+    env = {key: value for key, value in os.environ.items()
+           if key not in GIT_LOCATION_ENV}
+    cwd = os.getcwd()
+    try:
+        completed = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "HEAD"], capture_output=True,
+            text=True, timeout=5, check=False, cwd=cwd, env=env)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    head = completed.stdout.strip()
+    if completed.returncode != 0 or not FULL_HEAD.fullmatch(head):
+        return None
+    return head
+
+
+SEND_FIELDS = (
+    "head", "verdict", "ledger", "note", "reply_to", "supersedes",
+    "seen_peer_sequence", "depends_on", "prev_head", "reason", "host",
+    "action", "pid", "pgid", "lock", "count", "rearm", "rc", "receipt")
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
@@ -170,13 +258,24 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "send":
             optional = {
-                key: getattr(args, key)
-                for key in ("head", "verdict", "ledger", "note",
-                            "reply_to", "supersedes", "seen_peer_sequence")
+                key: getattr(args, key) for key in SEND_FIELDS
                 if getattr(args, key) is not None}
+            if ("head" not in optional and args.kind in AUTO_HEAD_KINDS
+                    and not args.no_auto_head):
+                head = _git_head()
+                if head is not None:
+                    optional["head"] = head
+                    print(f"agent-bus: --head auto-filled from git rev-parse "
+                          f"HEAD in {os.getcwd()}: {head} (pass --head if the "
+                          f"{args.kind} is about another checkout)",
+                          file=sys.stderr)
             message = bus.send(
                 args.from_peer, args.to_peer, args.kind, args.ref,
-                once=args.once, dedupe_window=args.dedupe_window, **optional)
+                once=args.once, dedupe_window=args.dedupe_window,
+                strict=args.strict or strict_default(),
+                assume_peer_upgraded=args.assume_peer_upgraded, **optional)
+            for warning in message.warnings:
+                print(f"agent-bus: warning: {warning}", file=sys.stderr)
             _render_message(message, args.json)
             return 0
         if args.command in ("inbox", "watch"):
@@ -266,7 +365,13 @@ def main(argv: list[str] | None = None) -> int:
                     or args.poll_interval <= 0):
                 raise BusError("poll interval must be finite and positive")
             started = time.monotonic()
-            messages, issues = bus.log()
+
+            def read_log() -> tuple[list[Message], list[str]]:
+                if args.ref is not None:
+                    return bus.thread(args.ref)
+                return bus.log()
+
+            messages, issues = read_log()
             seen = {message.message_sha256 for message in messages}
             for message in messages:
                 _render_message(
@@ -280,7 +385,7 @@ def main(argv: list[str] | None = None) -> int:
                              max(0.0, args.timeout - elapsed))
                 time.sleep(args.poll_interval if remaining is None else
                            min(args.poll_interval, remaining))
-                current, issues = bus.log()
+                current, issues = read_log()
                 for message in current:
                     if message.message_sha256 not in seen:
                         seen.add(message.message_sha256)

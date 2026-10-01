@@ -11,35 +11,115 @@ import re
 import stat
 import tempfile
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
 
 SCHEMA = "agent-bus/message"
+# Version 2 is the pre-0.4.0 envelope. Version 3 is written only when a
+# message carries a coordination kind or field introduced in 0.4.0, so an
+# unchanged sender keeps producing byte-identical version 2 lines.
 VERSION = 2
-SUPPORTED_VERSIONS = frozenset((1, VERSION))
-KINDS = frozenset(
+COORDINATION_VERSION = 3
+SUPPORTED_VERSIONS = frozenset((1, VERSION, COORDINATION_VERSION))
+LEGACY_KINDS = frozenset(
     ("ask-ready", "ask-withdrawn", "receipt-sealed", "run-started",
      "run-ended", "verdict", "blocker", "ruling", "task-ready",
      "result-ready", "status", "error", "fyi", "ack")
 )
+COORDINATION_KINDS = frozenset(("head-moved", "host", "decision"))
+KINDS = LEGACY_KINDS | COORDINATION_KINDS
 CHATTER_KINDS = frozenset(("ack", "status", "fyi"))
 ACTIONABLE_KINDS = frozenset(
     ("ask-ready", "receipt-sealed", "run-started", "run-ended", "verdict",
-     "blocker", "ruling", "task-ready", "result-ready", "error")
+     "blocker", "ruling", "task-ready", "result-ready", "error",
+     "head-moved", "host", "decision")
 )
-OPTIONAL_TEXT = frozenset(("head", "verdict", "ledger", "note"))
+HOST_ACTIONS = frozenset(
+    ("armed", "started", "preempted", "resumed", "released", "nominated"))
+# Host transitions that hand something to the recipient. The others describe
+# the sender's own state and collapse silently into the latest host line.
+HOST_ACTIONABLE_ACTIONS = frozenset(("preempted", "released", "nominated"))
+VERDICTS = frozenset(("PASS", "HOLD"))
+LEGACY_TEXT = frozenset(("head", "verdict", "ledger", "note"))
+COORDINATION_TEXT = frozenset(
+    ("prev_head", "reason", "host", "action", "lock", "rearm", "receipt",
+     "depends_on"))
+COORDINATION_INTEGERS = frozenset(("pid", "pgid", "count", "rc"))
+COORDINATION_FIELDS = COORDINATION_TEXT | COORDINATION_INTEGERS
+OPTIONAL_TEXT = LEGACY_TEXT | COORDINATION_TEXT
 OPTIONAL_LINKS = frozenset(("reply_to", "supersedes"))
 OPTIONAL_INTEGERS = frozenset(("seen_peer_sequence", "peer_sequence_at_send"))
-OPTIONAL = OPTIONAL_TEXT | OPTIONAL_LINKS | OPTIONAL_INTEGERS
+OPTIONAL = (OPTIONAL_TEXT | OPTIONAL_LINKS | OPTIONAL_INTEGERS
+            | COORDINATION_INTEGERS)
 REQUIRED = frozenset(("schema", "version", "sequence", "ts", "from", "to", "kind", "ref"))
 # These names are rejected explicitly even though unknown fields are rejected too.
 FORBIDDEN = frozenset(("authority", "grant", "execute"))
 SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 MESSAGE_LINK = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}:[1-9][0-9]{0,18}$")
+FULL_HEAD = re.compile(r"^[0-9a-f]{40}$")
+NOTE_SOFT_LIMIT = 280
+STRICT_ENV = "AGENT_BUS_STRICT"
+# Readers at or above this version accept version 3 lines. A reader records
+# the marker when it reads an inbox so senders can refuse to append a line an
+# older reader would report as malformed.
+READER_VERSION = "0.4.0"
+_GITHUB_THREAD = re.compile(
+    r"^((https?://[^\s#?]+?)/(?:pull|issues)/([0-9]+))", re.IGNORECASE)
+_PR_NUMBER = re.compile(r"^#?([1-9][0-9]{0,9})$")
+
+
+def strict_default() -> bool:
+    """Whether ``AGENT_BUS_STRICT`` asks for refusals instead of warnings."""
+    value = os.environ.get(STRICT_ENV, "").strip().lower()
+    return value not in ("", "0", "false", "no", "off")
+
+
+def thread_key(ref: str) -> str:
+    """Collapse a ref to the thread it belongs to.
+
+    GitHub PR and issue URLs collapse to the PR/issue URL without comment
+    anchors, so a verdict posted as a comment URL threads with the ask that
+    pointed at the PR. Anything else keeps its text without a fragment.
+    """
+    match = _GITHUB_THREAD.match(ref)
+    if match:
+        return match.group(1).lower()
+    return ref.split("#", 1)[0]
+
+
+def repo_of(ref: str) -> str | None:
+    """The repository URL a GitHub PR/issue ref belongs to, lowercased."""
+    match = _GITHUB_THREAD.match(ref)
+    return match.group(2).lower() if match else None
+
+
+def same_thread(query: str, ref: str, *, repo: str | None = None) -> bool:
+    """Whether ``ref`` belongs to the thread named by ``query``.
+
+    ``query`` may be a ref (threaded like ``thread_key``) or a bare PR/issue
+    number such as ``680`` or ``#680``. A bare number is scoped to ``repo``
+    when one is given (a dependency resolves inside the asking ref's own
+    repository); without ``repo`` it matches that number in any repository,
+    which is what an interactive ``log --ref 680`` wants.
+    """
+    number = _PR_NUMBER.match(query.strip())
+    if number:
+        match = _GITHUB_THREAD.match(ref)
+        if not match or match.group(3) != number.group(1):
+            return False
+        return repo is None or match.group(2).lower() == repo
+    return thread_key(query) == thread_key(ref)
+
+
+BODY_OPTIONAL_ORDER = (
+    "head", "verdict", "ledger", "note", "reply_to", "supersedes",
+    "seen_peer_sequence", "peer_sequence_at_send", "prev_head", "reason",
+    "host", "action", "lock", "rearm", "receipt", "depends_on", "pid",
+    "pgid", "count", "rc")
 
 
 class BusError(Exception):
@@ -64,8 +144,26 @@ class Message:
     supersedes: str | None = None
     seen_peer_sequence: int | None = None
     peer_sequence_at_send: int | None = None
+    # Coordination fields (0.4.0, schema version 3).
+    prev_head: str | None = None
+    reason: str | None = None
+    host: str | None = None
+    action: str | None = None
+    lock: str | None = None
+    rearm: str | None = None
+    receipt: str | None = None
+    depends_on: str | None = None
+    pid: int | None = None
+    pgid: int | None = None
+    count: int | None = None
+    rc: int | None = None
     message_sha256: str = ""
     duplicate_suppressed: bool = False
+    # Send-time advisories (never stored; strict mode turns them into errors).
+    warnings: tuple[str, ...] = ()
+    # Derived by thread/actionable views: a later head-moved or re-ask reported
+    # this head for the same thread, so a verdict no longer binds.
+    stale_head: str | None = None
 
     def body(self) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -74,9 +172,7 @@ class Message:
             "from": self.from_peer, "to": self.to_peer,
             "kind": self.kind, "ref": self.ref,
         }
-        for key in ("head", "verdict", "ledger", "note", "reply_to",
-                    "supersedes", "seen_peer_sequence",
-                    "peer_sequence_at_send"):
+        for key in BODY_OPTIONAL_ORDER:
             value = getattr(self, key)
             if value is not None:
                 data[key] = value
@@ -128,6 +224,14 @@ class ActionableItem:
     newest_sequence: int
     collapsed_transition_count: int
     sequence_anchors: tuple[str, ...]
+    # A verdict whose thread moved to another head after it was sent.
+    stale_head: str | None = None
+    # An ask whose dependency has no current PASS verdict.
+    blocked_on: str | None = None
+    # An ask whose thread moved after it was sent (``head`` is the new one).
+    head_moved_from: str | None = None
+    # Kind-specific fields worth showing without opening the raw message.
+    detail: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -138,6 +242,10 @@ class ActionableItem:
             "newest_sequence": self.newest_sequence,
             "collapsed_transition_count": self.collapsed_transition_count,
             "sequence_anchors": list(self.sequence_anchors),
+            "stale_head": self.stale_head,
+            "blocked_on": self.blocked_on,
+            "head_moved_from": self.head_moved_from,
+            "detail": dict(self.detail),
         }
 
 
@@ -243,6 +351,12 @@ def _validate_message(data: Any, *, expected_from: str | None = None,
         raise BusError("unsupported message schema/version")
     if data["version"] == 1 and keys & OPTIONAL_LINKS:
         raise BusError("message links require schema version 2")
+    coordination = bool(keys & COORDINATION_FIELDS
+                        or data["kind"] in COORDINATION_KINDS)
+    if coordination and data["version"] < COORDINATION_VERSION:
+        raise BusError("coordination fields require schema version 3")
+    if data["version"] >= COORDINATION_VERSION and not coordination:
+        raise BusError("schema version 3 without coordination fields")
     sequence = data["sequence"]
     if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence <= 0:
         raise BusError("invalid message sequence")
@@ -292,6 +406,13 @@ def _validate_message(data: Any, *, expected_from: str | None = None,
     if (integer_keys
             and data["seen_peer_sequence"] > data["peer_sequence_at_send"]):
         raise BusError("seen peer sequence exceeds available peer sequence")
+    for key in COORDINATION_INTEGERS:
+        if key in data and (isinstance(data[key], bool)
+                            or not isinstance(data[key], int)):
+            raise BusError(f"invalid message {key}")
+        if key in data and key != "rc" and data[key] < 0:
+            raise BusError(f"invalid message {key}")
+    _check_kind_shape(data)
     digest = data["message_sha256"]
     if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
         raise BusError("invalid message hash")
@@ -301,13 +422,79 @@ def _validate_message(data: Any, *, expected_from: str | None = None,
     return Message(
         schema=data["schema"], version=data["version"], sequence=sequence,
         ts=ts, from_peer=from_peer, to_peer=to_peer, kind=data["kind"], ref=data["ref"],
-        head=data.get("head"), verdict=data.get("verdict"), ledger=data.get("ledger"),
-        note=data.get("note"), reply_to=data.get("reply_to"),
-        supersedes=data.get("supersedes"),
+        reply_to=data.get("reply_to"), supersedes=data.get("supersedes"),
         seen_peer_sequence=data.get("seen_peer_sequence"),
         peer_sequence_at_send=data.get("peer_sequence_at_send"),
         message_sha256=digest,
+        **{key: data[key] for key in (LEGACY_TEXT | COORDINATION_FIELDS)
+           if key in data},
     )
+
+
+def _check_kind_shape(data: dict[str, Any]) -> None:
+    """Hard requirements of the 0.4.0 kinds.
+
+    These kinds are new, so no existing sender is broken by refusing a
+    malformed one outright; the advisory checks for legacy kinds live in
+    ``_advisories`` and only refuse under strict mode.
+    """
+    kind = data["kind"]
+    if kind == "head-moved":
+        for key in ("head", "prev_head"):
+            value = data.get(key)
+            if not isinstance(value, str) or not FULL_HEAD.fullmatch(value):
+                raise BusError(f"head-moved requires a full 40-hex {key}")
+        if data["head"] == data["prev_head"]:
+            raise BusError("head-moved head equals prev_head")
+    elif kind == "host":
+        if not isinstance(data.get("host"), str) or not data["host"]:
+            raise BusError("host requires a host name")
+        if data.get("action") not in HOST_ACTIONS:
+            raise BusError("host action must be one of "
+                           + ", ".join(sorted(HOST_ACTIONS)))
+    elif kind == "decision":
+        # The bus is not an authorisation surface; a decision must point at
+        # the place a human said it.
+        if not re.match(r"^https?://", data["ref"], re.IGNORECASE):
+            raise BusError(
+                "decision requires --ref pointing at the comment URL where the human decided")
+    dependency = data.get("depends_on")
+    if (dependency is not None and _PR_NUMBER.match(dependency.strip())
+            and repo_of(data["ref"]) is None):
+        raise BusError(
+            "a numeric --depends-on resolves inside the ref's own repository; "
+            "give a full PR URL when --ref is not a GitHub PR or issue URL")
+    if "action" in data and kind != "host" and data["action"] not in HOST_ACTIONS:
+        raise BusError("invalid message action")
+
+
+def _advisories(data: dict[str, Any]) -> list[str]:
+    """Soft contract checks: warnings by default, refusals under strict."""
+    found: list[str] = []
+    kind = data["kind"]
+    head = data.get("head")
+    if head is not None and not FULL_HEAD.fullmatch(head):
+        found.append(f"--head should be a full 40-hex commit sha, got {head!r}")
+    if kind == "verdict":
+        if data.get("verdict") not in VERDICTS:
+            found.append("verdict should carry --verdict PASS|HOLD")
+        if head is None:
+            found.append("verdict should carry --head (the reviewed commit)")
+    elif kind == "ask-ready" and head is None:
+        found.append("ask-ready should carry --head (the commit to review)")
+    elif kind == "decision" and "#" not in data["ref"]:
+        found.append("decision ref should be a comment URL (with a # anchor)")
+    note = data.get("note")
+    if note is not None and len(note) > NOTE_SOFT_LIMIT:
+        found.append(
+            f"note is {len(note)} chars; keep it under {NOTE_SOFT_LIMIT} and put "
+            "the evidence at the ref")
+    reason = data.get("reason")
+    if reason is not None and len(reason) > NOTE_SOFT_LIMIT:
+        found.append(f"reason is {len(reason)} chars; keep it short")
+    if "ledger" in data:
+        found.append("--ledger is deprecated and ignored by readers; point --ref at the ledger instead")
+    return found
 
 
 def _dedupe_key(data: dict[str, Any]) -> bytes:
@@ -448,10 +635,90 @@ def _decode_batch_token(token: str) -> dict[str, Any]:
     return payload
 
 
-def _actionable_items(messages: list[Message]) -> list[ActionableItem]:
-    """Reduce one recipient's pending messages without optimistic closure."""
+def _chronological(message: Message) -> tuple[str, str, int, str, str]:
+    return (message.ts, message.to_peer, message.sequence,
+            message.from_peer, message.message_sha256)
+
+
+def _current_head(thread: list[Message]) -> str | None:
+    """The head a thread is at now: the latest ask-ready or head-moved head."""
+    current = None
+    for message in thread:
+        if message.kind in ("ask-ready", "head-moved") and message.head is not None:
+            current = message.head
+    return current
+
+
+def _verdict_stale_head(verdict: Message, thread: list[Message]) -> str | None:
+    """The head that makes ``verdict`` stale, if any.
+
+    A verdict that names a head is stale whenever the thread's current head
+    (the latest ask-ready or head-moved head) differs from it, regardless of
+    message order: a PASS at A that arrives after the thread moved to B does
+    not become current. A verdict without a head cannot be compared, so it
+    is stale only once a head-moved follows it; a later re-ask alone is a
+    nudge, not a rebase.
+    """
+    current = _current_head(thread)
+    if verdict.head is not None:
+        return current if current is not None and current != verdict.head else None
+    after = False
+    moved = None
+    for message in thread:
+        if message is verdict:
+            after = True
+        elif after and message.kind == "head-moved":
+            moved = message.head
+    return moved
+
+
+def annotate_stale(messages: list[Message]) -> list[Message]:
+    """Mark verdicts whose thread is not at the head they reviewed."""
+    ordered = sorted(messages, key=_chronological)
+    by_key: dict[str, list[Message]] = {}
+    for message in ordered:
+        by_key.setdefault(thread_key(message.ref), []).append(message)
+    stale: dict[str, str | None] = {}
+    for thread in by_key.values():
+        for message in thread:
+            if message.kind == "verdict":
+                stale[message.message_sha256] = _verdict_stale_head(
+                    message, thread)
+    return [replace(message, stale_head=stale[message.message_sha256])
+            if (message.message_sha256 in stale
+                and stale[message.message_sha256] != message.stale_head)
+            else message
+            for message in ordered]
+
+
+def _dependency_satisfied(dependency: str, repo: str | None,
+                          annotated: list[Message]) -> bool:
+    """Whether the latest verdict on the dependency is a current PASS.
+
+    ``annotated`` is the project context after ``annotate_stale``; a bare
+    PR number resolves inside ``repo``, the asking ref's own repository.
+    """
+    verdicts = [message for message in annotated
+                if message.kind == "verdict"
+                and same_thread(dependency, message.ref, repo=repo)]
+    if not verdicts:
+        return False
+    latest = max(verdicts, key=_chronological)
+    return latest.verdict == "PASS" and latest.stale_head is None
+
+
+def _actionable_items(messages: list[Message],
+                      context: list[Message] | None = None
+                      ) -> list[ActionableItem]:
+    """Reduce one recipient's pending messages without optimistic closure.
+
+    ``context`` is the whole project log; when omitted only the pending
+    messages themselves are consulted for head moves and dependencies.
+    """
     if not messages:
         return []
+    if context is None:
+        context = list(messages)
     nodes = {f"{message.to_peer}:{message.sequence}": message
              for message in messages}
     superseded: set[str] = set()
@@ -491,9 +758,45 @@ def _actionable_items(messages: list[Message]) -> list[ActionableItem]:
                 closed.add(eligible[-1])
                 local_closers.add(anchor)
 
-    result: list[ActionableItem] = []
+    # A head move re-heads the open ask it follows instead of standing alone;
+    # a host line is the latest word about that host, and only a handoff
+    # (preempted/released/nominated) asks the recipient to do anything.
+    moved_into: dict[str, str] = {}
+    open_asks = [anchor for anchor, message in nodes.items()
+                 if message.kind == "ask-ready"
+                 and anchor not in superseded and anchor not in closed]
+    for anchor, message in nodes.items():
+        if message.kind != "head-moved":
+            continue
+        key = thread_key(message.ref)
+        earlier = [ask for ask in open_asks
+                   if thread_key(nodes[ask].ref) == key
+                   and nodes[ask].sequence < message.sequence]
+        if earlier:
+            moved_into[anchor] = earlier[-1]
+    latest_host: dict[str, str] = {}
+    for anchor, message in nodes.items():
+        if message.kind == "host" and message.host is not None:
+            previous = latest_host.get(message.host)
+            if previous is None or nodes[previous].sequence < message.sequence:
+                latest_host[message.host] = anchor
+    hidden_host = {anchor for anchor, message in nodes.items()
+                   if message.kind == "host"
+                   and (latest_host.get(message.host) != anchor
+                        or message.action not in HOST_ACTIONABLE_ACTIONS)}
+
+    annotated = annotate_stale(context)
+    stale_by_hash = {message.message_sha256: message.stale_head
+                     for message in annotated if message.kind == "verdict"}
+    by_key: dict[str, list[Message]] = {}
+    for message in context:
+        by_key.setdefault(thread_key(message.ref), []).append(message)
+
+    independent: list[ActionableItem] = []
+    blocked: list[ActionableItem] = []
     for anchor, message in nodes.items():
         if (anchor in superseded or anchor in closed or anchor in local_closers
+                or anchor in moved_into or anchor in hidden_host
                 or message.kind not in ACTIONABLE_KINDS):
             continue
         ancestry = [anchor]
@@ -503,14 +806,41 @@ def _actionable_items(messages: list[Message]) -> list[ActionableItem]:
             ancestry.append(prior)
             seen.add(prior)
             prior = nodes[prior].supersedes
+        ancestry.extend(mover for mover, target in moved_into.items()
+                        if target == anchor)
         ancestry.sort(key=lambda item: nodes[item].sequence)
-        result.append(ActionableItem(
-            kind=message.kind, ref=message.ref, head=message.head,
-            sender=message.from_peer, newest_sequence=message.sequence,
+        head = message.head
+        head_moved_from = None
+        if message.kind == "ask-ready":
+            for later in by_key.get(thread_key(message.ref), []):
+                if (later.kind == "head-moved"
+                        and _chronological(later) > _chronological(message)
+                        and later.head != head):
+                    head_moved_from = head_moved_from or head
+                    head = later.head
+        blocked_on = None
+        if (message.kind in ("ask-ready", "task-ready")
+                and message.depends_on is not None
+                and not _dependency_satisfied(
+                    message.depends_on, repo_of(message.ref), annotated)):
+            blocked_on = message.depends_on
+        detail = {key: getattr(message, key)
+                  for key in ("verdict", "depends_on", "host", "action",
+                              "count", "rc", "receipt", "prev_head", "reason")
+                  if getattr(message, key) is not None}
+        item = ActionableItem(
+            kind=message.kind, ref=message.ref, head=head,
+            sender=message.from_peer, newest_sequence=max(
+                nodes[item].sequence for item in ancestry),
             collapsed_transition_count=len(ancestry) - 1,
-            sequence_anchors=tuple(ancestry)))
-    result.sort(key=lambda item: item.newest_sequence)
-    return result
+            sequence_anchors=tuple(ancestry),
+            stale_head=stale_by_hash.get(message.message_sha256),
+            blocked_on=blocked_on, head_moved_from=head_moved_from,
+            detail=detail)
+        (blocked if blocked_on is not None else independent).append(item)
+    independent.sort(key=lambda item: item.newest_sequence)
+    blocked.sort(key=lambda item: item.newest_sequence)
+    return independent + blocked
 
 
 class Bus:
@@ -594,10 +924,56 @@ class Bus:
             finally:
                 os.close(fd)
 
+    def _peer_marker(self, peer: str) -> Path:
+        return self.state_dir / "peers" / f"{len(peer)}-{peer}.reader"
+
+    def _record_reader(self, to_peer: str) -> None:
+        """Remember that ``to_peer`` was consumed by a 0.4.0+ reader.
+
+        Only a cursor-advancing read or an acknowledgement counts: those are
+        made by the automation that actually consumes the inbox. A peek or
+        actionable view is diagnostic and may come from a human while an
+        older automation still reads the same inbox. Senders consult the
+        marker before appending a version 3 line, which a 0.3.0 reader
+        reports as malformed and then blocks on until it is upgraded.
+        """
+        peers = self.state_dir / "peers"
+        if not peers.exists() and not peers.is_symlink():
+            try:
+                peers.mkdir(mode=0o700)
+            except FileExistsError:
+                pass
+        _lstat(peers, "peer directory", directory=True)
+        marker = self._peer_marker(to_peer)
+        payload = _canonical({"reader_version": READER_VERSION}) + b"\n"
+        if marker.exists() and not marker.is_symlink():
+            _lstat(marker, "peer marker", directory=False)
+            if marker.read_bytes() == payload:
+                return
+        self._write_atomic(marker, payload, "peer marker")
+
+    def peer_reader_version(self, peer: str) -> str | None:
+        marker = self._peer_marker(peer)
+        if not marker.exists() and not marker.is_symlink():
+            return None
+        _lstat(marker, "peer marker", directory=False)
+        try:
+            data = json.loads(marker.read_text(encoding="ascii"))
+            version = data["reader_version"]
+            if not isinstance(version, str):
+                raise ValueError
+            return version
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError,
+                TypeError, ValueError) as exc:
+            raise BusError(f"invalid peer marker: {marker}") from exc
+
     def send(self, from_peer: str, to_peer: str, kind: str, ref: str, *,
              once: bool = False, dedupe_window: int = 20,
+             strict: bool | None = None, assume_peer_upgraded: bool = False,
              **optional: Any) -> Message:
         self._require_init()
+        if strict is None:
+            strict = strict_default()
         from_peer = _check_name(from_peer, "sender")
         to_peer = _check_name(to_peer, "recipient")
         if from_peer == to_peer:
@@ -638,8 +1014,11 @@ class Bus:
                 raise BusError(
                     f"existing inbox is malformed; refusing append: {exc}") from exc
             previous = index[-1][1].sequence if index else 0
+            coordination = bool(set(optional) & COORDINATION_FIELDS
+                                or kind in COORDINATION_KINDS)
             data: dict[str, Any] = {
-                "schema": SCHEMA, "version": VERSION,
+                "schema": SCHEMA,
+                "version": COORDINATION_VERSION if coordination else VERSION,
                 "sequence": previous + 1,
                 "ts": _utc_now(), "from": from_peer, "to": to_peer,
                 "kind": kind, "ref": ref,
@@ -655,14 +1034,28 @@ class Bus:
                             or not MESSAGE_LINK.fullmatch(optional[key])):
                         raise BusError(f"invalid message {key}")
                     data[key] = optional[key]
-            for key in OPTIONAL_INTEGERS:
+            for key in OPTIONAL_INTEGERS | COORDINATION_INTEGERS:
                 if key in optional:
                     data[key] = optional[key]
+            _check_kind_shape(data)
+            warnings = _advisories(data)
+            if strict and warnings:
+                raise BusError("strict: " + "; ".join(warnings))
+            if coordination and not assume_peer_upgraded:
+                reader = self.peer_reader_version(to_peer)
+                if reader is None:
+                    raise BusError(
+                        f"{to_peer} has not read this project with agent-bus >= "
+                        f"{READER_VERSION}; an older reader would report this "
+                        "coordination message as malformed and block its inbox. "
+                        "Upgrade the recipient first, or pass "
+                        "--assume-peer-upgraded")
             if once:
                 identity = _dedupe_key(data)
                 for _end, candidate in reversed(index[-dedupe_window:]):
                     if _dedupe_key(candidate.body()) == identity:
-                        return replace(candidate, duplicate_suppressed=True)
+                        return replace(candidate, duplicate_suppressed=True,
+                                       warnings=tuple(warnings))
             data["message_sha256"] = _hash_body(data)
             # Validate the complete envelope before the one append.  A bad API
             # argument must never poison an otherwise valid recipient log.
@@ -674,7 +1067,7 @@ class Bus:
             if written != len(line):
                 raise BusError("short append; message was not safely written")
             os.fsync(fd)
-            return message
+            return replace(message, warnings=tuple(warnings))
         finally:
             try:
                 fcntl.flock(fd, fcntl.LOCK_UN)
@@ -705,13 +1098,16 @@ class Bus:
 
     def _write_cursor(self, path: Path, offset: int) -> None:
         _lstat(path.parent, "cursor directory", directory=True)
-        payload = _canonical({"offset": offset}) + b"\n"
+        self._write_atomic(path, _canonical({"offset": offset}) + b"\n",
+                           "cursor")
+
+    def _write_atomic(self, path: Path, payload: bytes, label: str) -> None:
         fd, name = tempfile.mkstemp(prefix=".cursor.", dir=path.parent)
         temp = Path(name)
         try:
             os.fchmod(fd, 0o600)
             if os.write(fd, payload) != len(payload):
-                raise BusError("short cursor write")
+                raise BusError(f"short {label} write")
             os.fsync(fd)
             os.close(fd)
             os.replace(temp, path)
@@ -720,7 +1116,7 @@ class Bus:
                 os.fsync(dfd)
             finally:
                 os.close(dfd)
-            _lstat(path, "cursor", directory=False)
+            _lstat(path, label, directory=False)
         finally:
             try:
                 os.close(fd)
@@ -749,6 +1145,8 @@ class Bus:
                 raw, to_peer=to_peer, offset=offset)
             if not peek and not issues and next_offset != offset:
                 self._write_cursor(cursor, next_offset)
+            if not peek:
+                self._record_reader(to_peer)
             return messages, issues
         finally:
             try:
@@ -807,9 +1205,41 @@ class Bus:
 
     def actionable_inbox(self, to_peer: str, consumer: str) -> tuple[
             list[ActionableItem], list[str], InboxBatch | None]:
-        """Return a compact, cursor-neutral view of unresolved pending items."""
+        """Return a compact, cursor-neutral view of unresolved pending items.
+
+        Items come only from this recipient's pending batch. The whole
+        project log (every direction, read without cursors) is consulted
+        for context: PASS verdicts that satisfy a dependency and head moves
+        that make a verdict stale usually live in the other inbox.
+        """
         messages, issues, batch = self.peek_batch(to_peer, consumer)
-        return _actionable_items(messages), issues, batch
+        context = self._project_context() if messages else []
+        return _actionable_items(messages, context), issues, batch
+
+    def _project_context(self) -> list[Message]:
+        """Every readable message in every direction, oldest first."""
+        messages: list[Message] = []
+        for path in sorted((self.state_dir / "inboxes").glob("*.jsonl")):
+            try:
+                index = self._recipient_index(path.stem)
+            except BusError:
+                # A malformed peer log is reported by doctor and by that
+                # recipient's own reads; context stays best-effort.
+                continue
+            messages.extend(message for _end, message in index)
+        messages.sort(key=_chronological)
+        return messages
+
+    def thread(self, query: str) -> tuple[list[Message], list[str]]:
+        """Return the merged log restricted to one thread, verdicts annotated.
+
+        ``query`` is a ref or a bare PR/issue number. Verdicts whose thread
+        moved to another head afterwards carry ``stale_head``.
+        """
+        messages, issues = self.log()
+        selected = [message for message in messages
+                    if same_thread(query, message.ref)]
+        return annotate_stale(selected), issues
 
     def ack(self, to_peer: str, consumer: str, *,
             through_sequence: int) -> dict[str, int]:
@@ -851,6 +1281,7 @@ class Bus:
             target_offset = targets[0][0]
             if through_sequence > current_sequence:
                 self._write_cursor(cursor, target_offset)
+            self._record_reader(to_peer)
             return {"acked_sequence": through_sequence,
                     "offset": target_offset,
                     "pending_count": len(index) - through_sequence}
@@ -905,6 +1336,7 @@ class Bus:
             if recomputed != payload["digest"]:
                 raise BusError("batch token verification failed")
             self._write_cursor(cursor, payload["end_offset"])
+            self._record_reader(to_peer)
             return {
                 "acked_sequence": payload["end_sequence"],
                 "offset": payload["end_offset"],
