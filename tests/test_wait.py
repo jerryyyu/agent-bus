@@ -268,7 +268,7 @@ class WaitTests(unittest.TestCase):
                                                       "statusCheckRollup": [
                                                           {"status": "COMPLETED",
                                                            "conclusion": "SUCCESS"}]})),
-             "EVENT pr#7 checks success"),
+             "EVENT pr#7 checks complete success"),
         ]
         state = str(self.root / "wait.json")
         for change, expected in cases:
@@ -278,6 +278,94 @@ class WaitTests(unittest.TestCase):
             rc, out, err, _ = self.wait(*flags, "--state", state, bus=False)
             self.assertEqual(rc, 0, err)
             self.assertIn(expected, out)
+
+    # bursts and the per-source cap
+
+    def events(self, out: str) -> list[dict]:
+        return [json.loads(line) for line in out.splitlines() if line.strip()]
+
+    def test_a_bus_burst_emits_every_message_and_the_token(self) -> None:
+        for count in (20, 25):
+            for i in range(count):
+                self.bus.send("claude", "codex", "fyi", f"burst-{count}-{i}")
+            rc, out, err, _ = self.wait("--json")
+            self.assertEqual(rc, 0, err)
+            lines = self.events(out)
+            refs = [e["event"]["data"]["ref"] for e in lines if e["event"]["kind"] == "message"]
+            self.assertEqual(refs, [f"burst-{count}-{i}" for i in range(count)])
+            tokens = [e["event"]["data"]["token"] for e in lines if e["event"]["kind"] == "batch"]
+            self.assertEqual(len(tokens), 1)
+            self.bus.ack_batch("codex", "codex-session", token=tokens[0])
+            self.assertEqual(self.bus.inbox("codex", "codex-session", peek=True), ([], []))
+
+    def test_a_file_burst_past_the_cap_is_delivered_on_the_next_call(self) -> None:
+        status = self.root / "lane.status"
+        status.write_text("")
+        state = str(self.root / "wait.json")
+        spec = f"{status}:REC"
+        rc, _, _, _ = self.wait("--file", spec, "--state", state, "--arm", bus=False)
+        self.assertEqual(rc, 0)
+        status.write_text("".join(f"REC {i}\n" for i in range(1, 22)))
+        rc, out, _, _ = self.wait("--file", spec, "--state", state, bus=False)
+        self.assertEqual(rc, 0)
+        self.assertIn("REC 20", out)
+        self.assertNotIn("REC 21", out)
+        self.assertIn("more 1 more line pending", out)
+        rc, out, _, elapsed = self.wait("--file", spec, "--state", state, bus=False)
+        self.assertEqual(rc, 0)
+        self.assertIn("REC 21", out)
+        self.assertNotIn("REC 20\n", out)
+        self.assertLess(elapsed, 5)
+        rc, out, _, _ = self.wait("--file", spec, "--state", state, "--timeout", "2", bus=False)
+        self.assertEqual(rc, 1, out)
+
+    def test_a_comment_burst_does_not_hide_a_review_or_a_head_change(self) -> None:
+        self.gh("pr_view_7", json.dumps({"headRefOid": "a" * 40}))
+        self.gh("repos_o_r_issues_7_comments", "")
+        self.gh("repos_o_r_pulls_7_reviews", "")
+        self.gh("repos_o_r_pulls_7_comments", "")
+        flags = ("--gh-repo", "o/r", "--gh-pr", "7", "--state", str(self.root / "wait.json"))
+        rc, _, _, _ = self.wait(*flags, "--arm", bus=False)
+        self.assertEqual(rc, 0)
+        self.gh("repos_o_r_issues_7_comments",
+                "".join(f"{i} codex https://x/c{i}\n" for i in range(100, 125)))
+        self.gh("repos_o_r_pulls_7_reviews", "200 claude https://x/r200\n")
+        self.gh("pr_view_7", json.dumps({"headRefOid": "b" * 40}))
+        rc, out, err, _ = self.wait(*flags, bus=False)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("EVENT pr#7 review 200 claude", out)
+        self.assertIn(f"EVENT pr#7 head {'a' * 40}->{'b' * 40}", out)
+        self.assertIn("EVENT pr#7 more 5 more comment pending", out)
+        rc, out, _, _ = self.wait(*flags, bus=False)
+        self.assertEqual(rc, 0)
+        self.assertEqual([line.split()[4] for line in out.splitlines()],
+                         ["120", "121", "122", "123", "124"])
+
+    def test_checks_report_a_first_failure_and_then_completion(self) -> None:
+        def view(*runs: tuple[str, str]) -> None:
+            self.gh("pr_view_7", json.dumps({"headRefOid": "a" * 40, "statusCheckRollup": [
+                {"status": status, "conclusion": conclusion} for status, conclusion in runs]}))
+        for other in ("repos_o_r_issues_7_comments", "repos_o_r_pulls_7_reviews",
+                      "repos_o_r_pulls_7_comments"):
+            self.gh(other, "")
+        flags = ("--gh-repo", "o/r", "--gh-pr", "7", "--gh-checks",
+                 "--state", str(self.root / "wait.json"))
+        view(("IN_PROGRESS", ""), ("QUEUED", ""))
+        self.assertEqual(self.wait(*flags, "--arm", bus=False)[0], 0)
+        view(("COMPLETED", "FAILURE"), ("IN_PROGRESS", ""))
+        rc, out, _, _ = self.wait(*flags, bus=False)
+        self.assertEqual(rc, 0)
+        self.assertIn("EVENT pr#7 checks failure", out)
+        self.assertNotIn("complete", out)
+        rc, out, _, _ = self.wait(*flags, "--timeout", "2", bus=False)
+        self.assertEqual(rc, 1, out)
+        view(("COMPLETED", "FAILURE"), ("COMPLETED", "SUCCESS"))
+        rc, out, _, _ = self.wait(*flags, bus=False)
+        self.assertEqual(rc, 0)
+        self.assertIn(f"EVENT pr#7 checks complete failure head={'a' * 40}", out)
+        self.assertNotIn("checks failure", out)
+        rc, out, _, _ = self.wait(*flags, "--timeout", "2", bus=False)
+        self.assertEqual(rc, 1, out)
 
     # ssh and bounds
 

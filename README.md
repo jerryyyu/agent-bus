@@ -128,12 +128,14 @@ It prints one `NON_AUTHORITATIVE EVENT <source> <kind> <detail>` line per new
 item and exits 0, prints `TIMEOUT` and exits 1, or exits 2 on an error.
 
 - **Inbox:** fires while messages are pending for that consumer (peeked, never
-  acknowledged), so a message that arrived between turns is not lost. Ack the
-  printed batch token after handling it. `--actionable` fires only on
-  actionable items.
+  acknowledged), so a message that arrived between turns is not lost. Every
+  pending message and the batch token are printed; ack that token after
+  handling them. `--actionable` fires and prints only actionable items, but its
+  token still covers the whole pending batch, chatter included.
 - **PRs and issues:** a comment, review or review comment id above the highest
-  seen, or a new head sha. `--gh-state` adds closed/merged/reopened, and
-  `--gh-checks` adds the head's checks finishing.
+  seen, or a new head sha. `--gh-state` adds closed/merged/reopened.
+  `--gh-checks` adds `checks failure` on the observed head's first failed check
+  and `checks complete <conclusion>` once every check on it is terminal.
 - **Files:** a new complete line matching the regex, beyond the last one seen.
   `--ssh` reads the file with `ssh cat`; the path is shell-quoted and matching
   runs locally.
@@ -142,6 +144,10 @@ item and exits 0, prints `TIMEOUT` and exits 1, or exits 2 on an error.
   `--timeout` deadline. A stalled host therefore can't delay the other sources.
   A failed, partial or stalled read is never an event, and the last good
   observation is kept.
+- **Bursts:** each PR, issue or file source prints at most 20 items per call,
+  plus a `more` line. Comments, reviews, review comments and the head are
+  separate sources, so a comment burst never hides a review. `--state` saves
+  only what was printed, and the next call prints the rest.
 - **Across turns:** `--state` saves the PR, issue and file observations on exit
   and starts from them next time. To lose nothing, run `wait --arm --state …`
   (same sources) before your end-of-turn checks, then `wait --state …`.

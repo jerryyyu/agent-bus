@@ -33,11 +33,14 @@ A turn that has already ended needs an external wake; this never wakes it.
 Sources (each probed in its own child with a hard timeout bounded by the
 deadline; a probe that fails or stalls is unavailable, never an event):
   bus         messages still pending for --to/--consumer (peeked, never acked,
-              so messages from between turns fire; ack the printed batch after
-              handling it)
+              so messages from between turns fire). Every pending message and
+              the batch token are printed; ack that token after handling them.
+              With --actionable only actionable items print, but the token
+              still covers the whole pending batch, chatter included.
   --gh-pr N   a comment, review or review comment id above the highest seen, a
               new head sha; with --gh-state a closed/merged/reopened PR; with
-              --gh-checks the head's checks finishing (success or failure)
+              --gh-checks "checks failure" on the observed head's first failed
+              check and "checks complete <conclusion>" once all are terminal
   --gh-issue N  a comment id above the highest seen
   --file PATH[:REGEX], --ssh HOST:PATH[:REGEX]
               a complete line matching REGEX (Python re; every line without one)
@@ -46,7 +49,9 @@ deadline; a probe that fails or stalls is unavailable, never an event):
 
 Non-bus sources start from --state when it holds an observation, else from
 their first good read. To lose nothing between turns, run with --arm before
-checking PRs and files, then wait with the same --state.
+checking PRs and files, then wait with the same --state. A non-bus source
+prints at most 20 items per call plus a "more" line; --state saves only what
+was printed, so the next call prints the rest.
 """
 
 

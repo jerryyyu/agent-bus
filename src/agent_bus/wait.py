@@ -36,6 +36,8 @@ from .core import BusError
 STATE_SCHEMA = "agent-bus/wait-state-v1"
 # Exit status of the file probe's shell when the path does not exist.
 MISSING_RC = 44
+# Per source, not per label: a burst of comments never hides a review or a
+# head change. Undelivered items stay beyond the saved observation.
 MAX_EVENTS_PER_SOURCE = 20
 DETAIL_LIMIT = 400
 SSH_HOST = re.compile(r"[A-Za-z0-9_.%+@][A-Za-z0-9_.%+@-]*")
@@ -92,6 +94,8 @@ class Source:
 
 
 class BusSource(Source):
+    """Pending inbox messages; the whole peeked batch and its token, uncapped."""
+
     stateful = False
 
     def __init__(self, project: str, state_root: str | None, to_peer: str,
@@ -191,14 +195,24 @@ class GhItemsSource(Source):
             return [], {"max_id": top}
         seen = int(prior.get("max_id", 0))
         fresh = sorted(item for item in reading if item[0] > seen)
+        delivered = fresh[:MAX_EVENTS_PER_SOURCE]
         events = [Event(self.label, self.kind, _clip(f"{item_id} {rest}"),
-                        {"id": item_id}) for item_id, rest in fresh]
+                        {"id": item_id}) for item_id, rest in delivered]
+        if len(fresh) > len(delivered):
+            events.append(_more(self.label, self.kind, len(fresh) - len(delivered)))
+            return events, {"max_id": delivered[-1][0]}
         return events, {"max_id": max(seen, top)}
 
 
-def _ci_summary(rollup: Any) -> str:
+def _more(label: str, kind: str, count: int) -> Event:
+    return Event(label, "more", f"{count} more {kind} pending; they are next with --state",
+                 {"kind": kind, "count": count})
+
+
+def _ci_summary(rollup: Any) -> dict[str, Any]:
+    """Whether any check failed and whether every check is terminal."""
     if not rollup:
-        return "none"
+        return {"failed": False, "complete": False}
     pending = failed = False
     for check in rollup:
         if not isinstance(check, dict):
@@ -214,7 +228,7 @@ def _ci_summary(rollup: Any) -> str:
                 pending = True
             elif state in CI_RED_STATES:
                 failed = True
-    return "failure" if failed else "pending" if pending else "success"
+    return {"failed": failed, "complete": not pending}
 
 
 class GhPrViewSource(Source):
@@ -235,7 +249,7 @@ class GhPrViewSource(Source):
         return [self.gh, "pr", "view", str(self.number), "-R", self.repo,
                 "--json", ",".join(fields)]
 
-    def observe(self, rc: int, out: bytes) -> dict[str, str]:
+    def observe(self, rc: int, out: bytes) -> dict[str, Any]:
         if rc != 0:
             raise Unavailable(f"gh exit {rc}")
         try:
@@ -245,30 +259,43 @@ class GhPrViewSource(Source):
         if not isinstance(data, dict) or not isinstance(data.get("headRefOid"), str) \
                 or not data["headRefOid"]:
             raise Unavailable("gh pr view output has no head")
-        reading = {"head": data["headRefOid"]}
+        reading: dict[str, Any] = {"head": data["headRefOid"]}
         if self.watch_state:
             if not isinstance(data.get("state"), str):
                 raise Unavailable("gh pr view output has no state")
             reading["state"] = data["state"]
         if self.watch_checks:
-            reading["ci"] = _ci_summary(data.get("statusCheckRollup"))
+            summary = _ci_summary(data.get("statusCheckRollup"))
+            reading["ci_failed"], reading["ci_complete"] = summary["failed"], summary["complete"]
         return reading
 
-    def compare(self, prior: Any, reading: dict[str, str]) -> tuple[list[Event], Any]:
+    def compare(self, prior: Any, reading: dict[str, Any]) -> tuple[list[Event], Any]:
         if prior is None:
             return [], reading
         events = []
-        if prior.get("head") != reading["head"]:
+        same_head = prior.get("head") == reading["head"]
+        if not same_head:
             events.append(Event(self.label, "head",
                                 f"{prior.get('head')}->{reading['head']}", reading))
         if self.watch_state and prior.get("state") not in (None, reading["state"]):
             events.append(Event(self.label, "state",
                                 f"{prior['state']}->{reading['state']}", reading))
-        ci = reading.get("ci")
-        if (self.watch_checks and ci in ("success", "failure")
-                and (prior.get("ci") != ci or prior.get("head") != reading["head"])):
-            events.append(Event(self.label, "checks", f"{ci} head={reading['head']}",
-                                reading))
+        if self.watch_checks:
+            # A first failure and the moment every check is terminal are two
+            # events on one head; each fires once.
+            head = reading["head"]
+            if reading["ci_failed"] and not (same_head and prior.get("ci_failed")):
+                events.append(Event(self.label, "checks",
+                                    f"failure head={head} (some still running)"
+                                    if not reading["ci_complete"] else
+                                    f"failure head={head}",
+                                    {"checks": "failure", **reading}))
+            if reading["ci_complete"] and not (same_head and prior.get("ci_complete")):
+                conclusion = "failure" if reading["ci_failed"] else "success"
+                events.append(Event(self.label, "checks",
+                                    f"complete {conclusion} head={head}",
+                                    {"checks": "complete", "conclusion": conclusion,
+                                     **reading}))
         return events, reading
 
 
@@ -314,12 +341,17 @@ class FileSource(Source):
             return [], observation
         count, last = int(prior.get("count", 0)), prior.get("last")
         if len(reading) >= count and (count == 0 or reading[count - 1] == last):
-            fresh = reading[count:]
+            start = count
         elif last is not None and last in reading:
-            fresh = reading[len(reading) - reading[::-1].index(last):]
+            start = len(reading) - reading[::-1].index(last)
         else:
-            fresh = reading
-        return [Event(self.label, "line", _clip(line)) for line in fresh], observation
+            start = 0
+        end = min(len(reading), start + MAX_EVENTS_PER_SOURCE)
+        events = [Event(self.label, "line", _clip(line)) for line in reading[start:end]]
+        if end < len(reading):
+            events.append(_more(self.label, "line", len(reading) - end))
+        # The observation ends at the last delivered line.
+        return events, {"count": end, "last": reading[end - 1] if end else None}
 
 
 def _split_spec(spec: str, label: str) -> tuple[str, str | None]:
@@ -546,7 +578,23 @@ def run_wait(args: Any) -> int:
         if source.stateful and source.key in saved}
     events = poll(sources, observations, timeout=timeout, interval=interval,
                   probe_timeout=probe_timeout, arm=args.arm)
-    rc = EXIT_EVENT
+    # Print before saving: a failed write to stdout leaves the saved
+    # observations behind the undelivered events, so they repeat, not vanish.
+    if args.arm:
+        for source in sources:
+            word = "ARMED" if source.key in observations else "UNAVAILABLE"
+            _emit(args.json, {"armed": word == "ARMED", "source": source.key},
+                  f"{word} {source.key}")
+        rc = EXIT_EVENT if all(source.key in observations for source in sources) else EXIT_ERROR
+    elif not events:
+        _emit(args.json, {"timeout": timeout}, f"TIMEOUT after {timeout:g}s")
+        rc = EXIT_TIMEOUT
+    else:
+        for event in events:
+            _emit(args.json, {"event": {"source": event.source, "kind": event.kind,
+                                        "detail": event.detail, "data": event.data}},
+                  f"EVENT {event.source} {event.kind} {event.detail}")
+        rc = EXIT_EVENT
     if state_path is not None:
         merged = dict(saved)
         merged.update(observations)
@@ -556,27 +604,6 @@ def run_wait(args: Any) -> int:
             print(f"agent-bus: wait: state not saved, events will repeat: {exc}",
                   file=sys.stderr)
             rc = EXIT_ERROR
-    if args.arm:
-        for source in sources:
-            word = "ARMED" if source.key in observations else "UNAVAILABLE"
-            _emit(args.json, {"armed": word == "ARMED", "source": source.key},
-                  f"{word} {source.key}")
-        return rc if all(source.key in observations for source in sources) else EXIT_ERROR
-    if not events:
-        _emit(args.json, {"timeout": timeout}, f"TIMEOUT after {timeout:g}s")
-        return EXIT_TIMEOUT if rc == EXIT_EVENT else rc
-    by_source: dict[str, int] = {}
-    for event in events:
-        by_source[event.source] = by_source.get(event.source, 0) + 1
-        if by_source[event.source] > MAX_EVENTS_PER_SOURCE:
-            continue
-        _emit(args.json, {"event": {"source": event.source, "kind": event.kind,
-                                    "detail": event.detail, "data": event.data}},
-              f"EVENT {event.source} {event.kind} {event.detail}")
-    for source, count in by_source.items():
-        if count > MAX_EVENTS_PER_SOURCE:
-            _emit(args.json, {"truncated": {"source": source, "count": count}},
-                  f"EVENT {source} truncated {count - MAX_EVENTS_PER_SOURCE} more")
     return rc
 
 
