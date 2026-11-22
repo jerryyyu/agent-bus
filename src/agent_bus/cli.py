@@ -11,6 +11,7 @@ from typing import Any
 
 from .core import (ActionableItem, Bus, BusError, FULL_HEAD, HOST_ACTIONS,
                    InboxBatch, Message, strict_default)
+from .wait import run_wait
 
 AUTO_HEAD_KINDS = frozenset(("ask-ready", "verdict"))
 GIT_LOCATION_ENV = frozenset((
@@ -21,6 +22,37 @@ COMPACT_FIELDS = (
     "verdict", "head", "prev_head", "depends_on", "host", "action", "pid",
     "pgid", "count", "lock", "rearm", "rc", "receipt", "reason", "ledger",
     "reply_to", "supersedes")
+
+WAIT_DESCRIPTION = """\
+Block until one source has something new, print it, and exit:
+0 an event, 1 the timeout, 2 an error.
+
+The call returns only into a turn that is still running (a blocking tool call).
+A turn that has already ended needs an external wake; this never wakes it.
+
+Sources (each probed in its own child with a hard timeout bounded by the
+deadline; a probe that fails or stalls is unavailable, never an event):
+  bus         messages still pending for --to/--consumer (peeked, never acked,
+              so messages from between turns fire). Every pending message and
+              the batch token are printed; ack that token after handling them.
+              With --actionable only actionable items print, but the token
+              still covers the whole pending batch, chatter included.
+  --gh-pr N   a comment, review or review comment id above the highest seen, a
+              new head sha; with --gh-state a closed/merged/reopened PR; with
+              --gh-checks "checks failure" on the observed head's first failed
+              check and "checks complete <conclusion>" once all are terminal
+  --gh-issue N  a comment id above the highest seen
+  --file PATH[:REGEX], --ssh HOST:PATH[:REGEX]
+              a complete line matching REGEX (Python re; every line without one)
+              beyond the last observed one. Matching runs locally; the path is
+              shell-quoted for the remote shell and may not contain ':'.
+
+Non-bus sources start from --state when it holds an observation, else from
+their first good read. To lose nothing between turns, run with --arm before
+checking PRs and files, then wait with the same --state. A non-bus source
+prints at most 20 items per call plus a "more" line; --state saves only what
+was printed, so the next call prints the rest.
+"""
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -106,6 +138,41 @@ def _parser() -> argparse.ArgumentParser:
             command.add_argument(
                 "--actionable", action="store_true",
                 help="emit only when the cursor-neutral actionable set changes")
+
+    wait = sub.add_parser(
+        "wait", help="block until the inbox, a PR, an issue or a file has news",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=WAIT_DESCRIPTION)
+    project_args(wait)
+    wait.add_argument("--to", dest="to_peer", help="recipient agent ID (the bus source)")
+    wait.add_argument("--consumer", help="consumer cursor to peek (never advanced)")
+    wait.add_argument("--actionable", action="store_true",
+                      help="fire on pending actionable items, not every pending message")
+    wait.add_argument("--no-bus", action="store_true", help="do not watch the inbox")
+    wait.add_argument("--gh-repo", help="OWNER/REPO for --gh-pr and --gh-issue")
+    wait.add_argument("--gh-pr", type=int, action="append", metavar="N",
+                      help="new comment, review, review comment or head sha")
+    wait.add_argument("--gh-issue", type=int, action="append", metavar="N",
+                      help="new issue comment")
+    wait.add_argument("--gh-state", action="store_true",
+                      help="also fire when a --gh-pr is closed, merged or reopened")
+    wait.add_argument("--gh-checks", action="store_true",
+                      help="also fire when a --gh-pr head's checks finish")
+    wait.add_argument("--file", action="append", metavar="PATH[:REGEX]",
+                      help="new complete line (matching REGEX) in a local file")
+    wait.add_argument("--ssh", action="append", metavar="HOST:PATH[:REGEX]",
+                      help="the same for a file on HOST, read with ssh cat")
+    wait.add_argument("--state", metavar="PATH",
+                      help="observations to start from and save on exit")
+    wait.add_argument("--arm", action="store_true",
+                      help="record one observation of each non-bus source in --state, then exit")
+    wait.add_argument("--timeout", type=float, default=3600.0,
+                      help="wall-clock bound on the whole wait, probes included (default 3600)")
+    wait.add_argument("--interval", type=float, default=30.0,
+                      help="seconds between probes of one source (default 30, minimum 1)")
+    wait.add_argument("--probe-timeout", type=float, default=30.0,
+                      help="hard cap on one probe (default 30)")
+    wait.add_argument("--json", action="store_true")
 
     status = sub.add_parser("status", help="show state size and project ID")
     project_args(status)
@@ -221,8 +288,8 @@ def _render_actionable(items: list[ActionableItem], issues: list[str],
 def _git_head() -> str | None:
     """The checked-out commit of the current directory, if it is a repo.
 
-    This is the package's only subprocess: a fixed argv that never includes
-    bus text. It is a convenience for the sender's own checkout and nothing
+    A fixed argv that never includes bus text; the only other subprocesses
+    are the probes of ``wait``, built from its own arguments. It is a convenience for the sender's own checkout and nothing
     else; pass --head when the reviewed commit lives elsewhere.
     """
     # An inherited GIT_DIR/GIT_WORK_TREE would select another repository;
@@ -395,6 +462,12 @@ def main(argv: list[str] | None = None) -> int:
             for issue in issues:
                 print(f"NON_AUTHORITATIVE issue: {issue}", file=sys.stderr)
             return 2 if issues else 0
+        if args.command == "wait":
+            if not args.no_bus:
+                if args.to_peer is None or args.consumer is None:
+                    raise BusError("wait needs --to and --consumer, or --no-bus")
+                bus.inbox(args.to_peer, args.consumer, peek=True)
+            return run_wait(args)
         if args.command == "doctor":
             findings = bus.doctor()
             if args.json:
