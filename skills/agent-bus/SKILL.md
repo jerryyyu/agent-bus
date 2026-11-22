@@ -84,14 +84,20 @@ sources before the end-of-turn checks, so nothing that lands in between is
 lost:
 
 ```sh
-W="agent-bus wait --project /path/to/project --to codex --consumer codex-session \
-  --gh-repo owner/repo --gh-pr 123 --gh-checks --file /path/job.status:DONE|ABORT \
-  --state $HOME/.codex-wait.json"
-$W --arm                    # 1. record PR and file positions
-agent-bus inbox --project /path/to/project --to codex \
+bus_wait() {   # one function for arm and wait: quoted paths, extra flags forwarded
+  agent-bus wait --project "/path/to/project" --to codex --consumer codex-session \
+    --gh-repo owner/repo --gh-pr 123 --gh-checks \
+    --file "/path/job.status:DONE|ABORT" --state "$HOME/.codex-wait.json" "$@"
+}
+bus_wait --arm                              # 1. record PR and file positions
+agent-bus inbox --project "/path/to/project" --to codex \
   --consumer codex-session --peek --batch --json   # 2. reconcile: handle, verify
-$W --json --timeout 3600    # 3. last call: exit 0 event, 1 timeout, 2 error
-agent-bus ack --project /path/to/project --to codex \
+bus_wait --json --timeout 3600 > wait.jsonl # 3. last call: exit 0 event, 1 timeout, 2 error
+TOKEN=$(python3 -c 'import json,sys
+for line in open(sys.argv[1]):
+    e = json.loads(line).get("event") or {}
+    if e.get("source") == "bus" and e.get("kind") == "batch": print(e["data"]["token"])' wait.jsonl)
+[ -n "$TOKEN" ] && agent-bus ack --project "/path/to/project" --to codex \
   --consumer codex-session --batch "$TOKEN"         # 4. after handling every message
 ```
 
